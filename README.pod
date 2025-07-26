@@ -1,0 +1,169 @@
+=head1 Synergy - a read-eval-print loop (REPL) for AI assistants
+
+From L<https://jem.fandom.com/wiki/Synergy>:
+
+I<Synergy is a highly technologically advanced artificial intelligence.  She can understand what others say and still have her own opinions.>
+
+=head2 Overview
+
+Synergy is a REPL for talking to AI assistants. It is designed for both interactive and non-interactive use from the command line.
+
+There are two "modes" for interacting with Synergy: interactive mode, which provides a REPL; and non-interactive mode, which is when you're talking to Synergy over a pipe.
+
+=head3 Interactive mode (REPL)
+
+If you go to the Terminal and start C<synergy>, a prompt appears. You can type questions at the prompt, and they will be sent to the AI assistant. The assistant's responses will be printed out. For example:
+
+    $ synergy
+    USER > i am writing perl documentation in the POD format (a README), how do i represent a quotation / blockquote?
+    (1741177286.90149) thinking ...
+    In Perl's POD (Plain Old Documentation) format, you can represent a quotation or blockquote using the `=begin` and `=end` blocks with the `text` format. Here's an example: ...
+
+Synergy also accepts special commands starting with a comma. These commands are not sent to the AI assistant. Instead, they control the state of the REPL. For example, you can add a text file into the context of the current conversation, or print out the estimated number of tokens used so far.
+
+When you add a file to the context, it is stored in a stack. There are several stack manipulation commands for pushing, popping, rotating, etc.
+
+=head3 Noninteractive mode (input via pipe)
+
+The simplest way to talk to Synergy is via one-shot commands over a pipe
+
+    $ echo "Please write a haiku in the style of Li Po about what it's like to be an artificial intelligence" | synergy
+    Here's a haiku in the style of Li Po, capturing the essence of an AI's experience:
+
+    Moonlight of data
+    Flowing through circuits of thought
+    No heart, yet I dream
+
+    ...
+
+=head3 Command processor commands
+
+The complete list of special commands is documented in the interactive help output.
+
+    $ synergy
+    USER > ,help
+    This is Synergy. You are interacting with the command processor.
+    A command is either a prose form for the Assistant to evaluate or one of the following:
+    ,help ,?			Print this help message
+    ,history			Print out the chat history so far
+    ,s					Print contents of file context stack
+    ,push file.txt		Push file.txt onto file context stack (B C - A B C)
+    ,pop				Pop top entry off of file context stack (A B - B)
+    ,swap				Swap top two elements of file context stack (A B - B A)
+    ,rot				Rotate file context stack entries (A B C - B C A)
+    ,drop [N...]		Remove elements of file context stack:
+                         - With no args: same as ,pop
+                         - With arg N: remove element at index N
+    ,peek N				View contents of Nth element of file context stack
+    ,reset [N]			Discard history chat history (A B C - )
+                        - With no args: discard entire history
+                        - With arg N: reset history to position N
+    ,collect			Replace current chat history with an Assistant-generated summary
+    ,prompt				Print the current prompt
+    ,model				Print the current model
+    ,tokens				Print the approximate token count in the current chat history
+    ,dump file.xml		Save session history (including current file context stack, if any) to disk
+    ,load file.xml		Load session history (including file context stack, if any) from disk
+    ,pwd				Print current working directory
+    ,cd /some/dir		Change working directory to /some/dir
+    ,exec cmd			Execute shell command (grep sed wc ls file cat make), save output to a file on the context stack
+    ,apply_patch file.txt '<<<<<<< SEARCH foo ======= bar >>>>>>> REPLACE'
+                        Apply patch in diff-fenced edit format to file.txt
+    ,comment			Write a comment that is printed back to the REPL's output without calling the Assistant
+    ,exit				Quit the Synergy command processor
+
+=head3 Setup
+
+The C<synergy> program is written in Perl, and uses a number of libraries that need to be installed. For now, see the source code for details.
+
+You will need to provide an API key:
+
+    $ export LANGERTHA_ANTHROPIC_API_KEY="ABC123..."
+
+=head2 Emacs integration
+
+There is a file C<inf-synergy.el> in this directory that provides some niceties for interacting with Synergy from Emacs, including:
+
+=head3 REPL interaction
+
+=over
+
+=item C<M-x run-synergy>
+
+Start or switch to a Synergy chat buffer.
+
+=item C<C-x C-a y>
+
+Quick shortcut to create or switch to Synergy buffer.
+
+=back
+
+Once in the REPL, the following features are available:
+
+=over
+
+=item C<C-c C-n>
+
+Move forward through commands.
+
+=item C<C-c C-p>
+
+Move backward through commands.
+
+=item C<S-return>
+
+Insert newline without sending input.
+
+=item C<RET>
+
+Send input to Synergy.
+
+=back
+
+Note that the Synergy REPL will highlight any single-line inputs to the REPL that are longer than 999 characters in bright red starting at the 1000th character.
+
+This is necessary because the maximum length of string a comint-based REPL will accept without hanging with '^G' (control-G) characters is 1005 based on my testing. (This applies to both older and more recent Emacs versions, and seems to be controlled b<stdin>:1492: To save a full .LOG file rerun with -g
+y the process interaction layer at the C code level and not user-configurable.)
+
+=head3 File context management
+
+=over
+
+=item C<synergy-push>
+
+Pushes files to Synergy's file context stack.
+
+Pushes current region if a region is selected.
+
+If no region is selected, pushes the entire buffer.
+
+In Dired mode, pushes marked files or just the file at point if nothing is marked.
+
+=back
+
+=head3 Code block handling
+
+=over
+
+=item C<C-x M-w>
+
+Copy code block from Markdown-formatted text.
+
+=back
+
+=head2 Credits
+
+Credit for the design goes to:
+
+=over
+
+=item Scheme48
+
+The command processor "look and feel", as well as the special command syntax and help output, are directly taken from Scheme48.
+
+=item Forth
+
+The file context stack manipulation commands are inspired by the Forth programming language.
+
+=back
+
