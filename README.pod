@@ -19,7 +19,7 @@ If you go to the Terminal and start C<synergy>, a prompt appears. You can type q
     (1741177286.90149) thinking ...
     In Perl's POD (Plain Old Documentation) format, you can represent a quotation or blockquote using the `=begin` and `=end` blocks with the `text` format. Here's an example: ...
 
-Synergy also accepts special commands starting with a comma. These commands are not sent to the AI assistant. Instead, they control the state of the REPL. For example, you can add a text file into the context of the current conversation, or print out the estimated number of tokens used so far.
+Synergy also accepts special commands starting with a comma. These commands are not sent to the AI assistant. Instead, they control the state of the REPL. For example, you can add a text file into the context of the current conversation, or serialize the current session to disk as an XML file.
 
 When you add a file to the context, it is stored in a stack. There are several stack manipulation commands for pushing, popping, rotating, etc.
 
@@ -44,33 +44,54 @@ The complete list of special commands is documented in the interactive help outp
     USER > ,help
     This is Synergy. You are interacting with the command processor.
     A command is either a prose form for the Assistant to evaluate or one of the following:
+
+    General commands:
     ,help ,?			Print this help message
-    ,history			Print out the chat history so far
+    ,exit				Quit the SYNERGY command processor
+
+    History Management:
+    ,history			Print out the conversation history so far
+    ,reset				Discard conversation history and file context (A B C - )
+    ,collect			Replace current conversation history with a summary
+
+    File Context:
     ,s					Print contents of file context stack
     ,push file.txt		Push file.txt onto file context stack (B C - A B C)
-    ,pop				Pop top entry off of file context stack (A B - B)
     ,swap				Swap top two elements of file context stack (A B - B A)
     ,rot				Rotate file context stack entries (A B C - B C A)
     ,drop [N...]		Remove elements of file context stack:
-                         - With no args: same as ,pop
-                         - With arg N: remove element at index N
+                         - With no args: pop top stack element (A B C - B C)
+                         - With arg N: remove element at index N (A B .. N - A B ..)
     ,peek N				View contents of Nth element of file context stack
-    ,reset [N]			Discard history chat history (A B C - )
-                        - With no args: discard entire history
-                        - With arg N: reset history to position N
-    ,collect			Replace current chat history with an Assistant-generated summary
-    ,prompt				Print the current prompt
-    ,model				Print the current model
-    ,tokens				Print the approximate token count in the current chat history
+
+    Session Management:
     ,dump file.xml		Save session history (including current file context stack, if any) to disk
     ,load file.xml		Load session history (including file context stack, if any) from disk
+
+    System Interaction:
     ,pwd				Print current working directory
     ,cd /some/dir		Change working directory to /some/dir
-    ,exec cmd			Execute shell command (grep sed wc ls file cat make), save output to a file on the context stack
-    ,apply_patch file.txt '<<<<<<< SEARCH foo ======= bar >>>>>>> REPLACE'
+    ,exec cmd			Execute shell command (grep sed wc ls file find cat make head)
+                        Output is saved to conversation history
+
+    Agent Interaction:
+    ,agent <prompt>		Prompt the system to complete a task autonomously using this command set.
+                        Agent has access to: ,exec ,apply_patch ,comment
+                        Agent prints a summary of work when completed. Enter Ctrl-C to exit loop.
+    ,apply_patch file.txt '<<<<<<< ORIGINAL
+                           foo
+                           =======
+                           bar
+                           >>>>>>> UPDATED'
                         Apply patch in diff-fenced edit format to file.txt
-    ,comment			Write a comment that is printed back to the REPL's output without calling the Assistant
-    ,exit				Quit the Synergy command processor
+    ,comment			Write a comment that is printed back to the REPL's output.
+                        This is useful for notes to self by humans or AI agents.
+
+    Model Settings:
+    ,model [name]       Print (or switch) the current model
+                        - With no args: Print the current model and the list of options
+                        - With name (e.g., `gpt-5`): Switch to model with that name
+    ,encoded			Base64 encode contents of API calls to the Assistant (default ON)
 
 =head3 Setup
 
@@ -78,78 +99,7 @@ The C<synergy> program is written in Perl, and uses a number of libraries that n
 
 You will need to provide an API key:
 
-    $ export LANGERTHA_ANTHROPIC_API_KEY="ABC123..."
-
-=head2 Emacs integration
-
-There is a file C<inf-synergy.el> in this directory that provides some niceties for interacting with Synergy from Emacs, including:
-
-=head3 REPL interaction
-
-=over
-
-=item C<M-x run-synergy>
-
-Start or switch to a Synergy chat buffer.
-
-=item C<C-x C-a y>
-
-Quick shortcut to create or switch to Synergy buffer.
-
-=back
-
-Once in the REPL, the following features are available:
-
-=over
-
-=item C<C-c C-n>
-
-Move forward through commands.
-
-=item C<C-c C-p>
-
-Move backward through commands.
-
-=item C<S-return>
-
-Insert newline without sending input.
-
-=item C<RET>
-
-Send input to Synergy.
-
-=back
-
-Note that the Synergy REPL will highlight any single-line inputs to the REPL that are longer than 999 characters in bright red starting at the 1000th character.
-
-This is necessary because the maximum length of string a comint-based REPL will accept without hanging with '^G' (control-G) characters is 1005 based on my testing. (This applies to both older and more recent Emacs versions, and seems to be controlled b<stdin>:1492: To save a full .LOG file rerun with -g
-y the process interaction layer at the C code level and not user-configurable.)
-
-=head3 File context management
-
-=over
-
-=item C<synergy-push>
-
-Pushes files to Synergy's file context stack.
-
-Pushes current region if a region is selected.
-
-If no region is selected, pushes the entire buffer.
-
-In Dired mode, pushes marked files or just the file at point if nothing is marked.
-
-=back
-
-=head3 Code block handling
-
-=over
-
-=item C<C-x M-w>
-
-Copy code block from Markdown-formatted text.
-
-=back
+    $ export ANTHROPIC_API_KEY="ABC123..."
 
 =head2 Credits
 

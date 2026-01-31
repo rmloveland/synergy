@@ -1,0 +1,367 @@
+fd1b943 2026-01-31 Test for HTTP errors and missing API keys
+29b13d0 2026-01-31 Add more tests for bad JSON and curl execution failures
+ec0493d 2026-01-31 Add more tests of JSON generation for various APIs
+957d30b 2026-01-31 Use curl instead of Perl HTTP libs
+c62bce4 2026-01-31 Remove Emacs dependencies from Makefile
+9b2266e 2026-01-20 Regularize output formats a bit (more to come)
+715dcb1 2026-01-18 Add a simple ,INSPECT command for development use
+b405e73 2026-01-17 Update help text, break commands into sections
+dfe18e5 2026-01-16 Remove the mostly useless ,TOKENS command
+eac3028 2026-01-16 Move most tests to use an autocleaned temp dir
+3e96152 2026-01-16 Update ,DUMP to append timestamps to filenames
+c99ff79 2026-01-16 Remove buggy ,RESET <N> implementation
+b6c2022 2025-12-21 Update to Gemini 3 Flash
+9245f6e 2025-12-19 Add OpenAI o3 to model list
+111465c 2025-12-12 Allow agents to use `nl` command
+d3e1801 2025-12-12 Add GPT-5 nano to the list
+c578356 2025-12-12 Update to Claude Opus 4.5
+6f88ac1 2025-12-12 Update to Gemini 3.0 Pro (preview)
+0a9be1b 2025-12-12 Add GPT-5-mini
+0b6b60f 2025-12-12 Update to GPT-5.2
+6b04554 2025-12-12 Add ASCII art image of Synergy
+97c6850 2025-12-09 Add page breaks around DEBUG output
+786c4bd 2025-11-22 DRY up prompt interpolation logic
+fe78a68 2025-11-22 Refactor `$base_system_prompt` out of the loop
+1d304f8 2025-11-22 Disable VERBOSE, remove all its output
+489ddc7 2025-11-18 Bump GPT to 5.1
+706d71a 2025-11-17 ALWAYS add ,exec output in temp file to convo
+f39f24e 2025-11-14 Bugfix: Use exit code from the ,exec command
+e353a38 2025-11-13 Tweak AGENTS.md
+bac7488 2025-11-12 Delete obsolete design docs
+10877f5 2025-11-12 Update helptext
+0a6fab1 2025-11-04 Update Makefile
+a34105c 2025-11-04 Take an edit pass over the comments
+54c522d 2025-11-04 Reorganize the helptext a bit
+2edd274 2025-11-04 Remove unused ,PROMPT command
+2b72b51 2025-11-03 Add a basic AGENTS.md
+09cc758 2025-11-03 Don't run regex on an undefined variable
+50ba694 2025-11-03 Simplify ,AGENT instructions, include AGENTS.md
+0a3741d 2025-11-03 Remove `perl` from list of allowed commands
+fa7821d 2025-11-03 Convert all `our $foo` to `my $foo`
+2879ca0 2025-11-03 Fix bug when ,RESET has no args
+a48f55e 2025-11-03 Remove unused ,LEADER command
+cbfeb5a 2025-11-03 Fix SYN-047: Remove ,POP (use ,DROP instead)
+cfe7a75 2025-10-30 Fix SYN-029: 'peek' command accepts bad indexes
+be7ac13 2025-10-30 Strip whitespace from ,model argument
+53f53c9 2025-10-30 Add Claude 4.1 Opus to ,model command
+d38149d 2025-10-30 SYN-046 Fix apply_patch ORIGINAL block matching
+59c8465 2025-10-29 Parse multi-line agent inputs less verbosely
+779bcad 2025-10-28 Add perl to allowed commands for one liners
+3e08fbb 2025-10-28 Turn VERBOSE output back on, for now
+58ee74e 2025-10-28 Revise and clean up ,help output
+670afe1 2025-10-28 Implement `,reset N`; unify agent/human state
+d701e65 2025-10-24 Revise agent prompt for clarity
+2f7b2c8 2025-10-24 Handle multi-line model responses in ,agent mode
+560a38c 2025-10-24 Escape all input we send to the API call
+7549848 2025-10-24 Unify all history in @convo (and encoding)
+9a49b33 2025-10-24 Update tests to match removal of `EXIT_CODE`
+8c9c588 2025-10-24 Remove `EXIT_CODE: ...` from ,exec output
+aadfeb3 2025-10-23 Agents may not run ,cd
+99c035b 2025-10-23 Allow agents to run commands repeatedly
+dfc43db 2025-10-17 SYN-039: Handle responses w/code points over 0xFF
+65ed27f 2025-10-16 Fix SYN-038: apply_patch only appends to files
+26d8421 2025-10-16 Added switching capabilities to `,model` command
+12ef75d 2025-10-15 Revert "Update multi-line agent parsing"
+f768e23 2025-10-15 Undo 'Rip out expensive, unreliable "agent mode"'
+fd19a48 2025-10-13 Rip out expensive, unreliable "agent mode"
+59ab07b 2025-10-13 Update multi-line agent parsing
+d905547 2025-10-13 Default back to Claude 4.5 Sonnet
+46cbe93 2025-10-13 Refactor main prompt text to live in one place
+f5adcf3 2025-10-12 Fix the "endless loop" bug in the ,agent command
+cb34264 2025-09-16 Add Emacs command M-x SYNERGY-SEARCH-LOGS
+16edace 2025-09-16 Try out a new ASCII banner for fun
+114b070 2025-09-06 Update help output to use current leader key
+6c280d4 2025-09-06 Add ,leader command to change command leader key
+826f6da 2025-09-05 Add command to toggle encoding of convo/context
+3578530 2025-09-05 Blank REPL input should never result in API calls
+f93cce4 2025-08-30 Have `make clean` remove CHANGELOG, too
+f096297 2025-08-30 Move MCL design docs to etc/notes
+14529dd 2025-08-30 Update how CHANGELOG is generated
+4ec1475 2025-08-29 Update agent prompt as a "DOs & DON'Ts" list
+2870245 2025-08-27 Update agent mode prompts with Gemini feedback
+5b9a713 2025-08-26 Fix bug where ,cd with no args would barf
+2f642b9 2025-08-25 Tweak output of ,s when stack is empty
+b66d792 2025-08-24 Update system prompt with Claude's feedback
+8bf7360 2025-08-22 Add tests for more ,apply_patch scenarios
+4d115bb 2025-08-21 Add perl code w/INLINE COMMENTS to tests
+f1776f7 2025-08-20 Allow agents to re-run `make` commands
+9923cb9 2025-08-20 Remove unused 'print_agent_typing' subroutine
+c422795 2025-08-20 Sleep longer between agent requests
+3de20b0 2025-08-20 Update agent mode prompt
+b41f858 2025-08-20 Re-use the command variable used by ,exec
+1d04480 2025-08-20 Update ,exec so it outputs to the REPL
+d592f53 2025-08-17 ,dump with no args uses a filename based on ,sid
+53caa02 2025-08-17 Add local .ackrc file
+53279cd 2025-08-17 Auto-dump if user quits with Ctrl-d, too
+aecf1eb 2025-08-17 Use Gemini 2.5 Flash as our default model
+b9fcc56 2025-08-17 Get all tests passing
+37c9446 2025-08-12 Add `find` and `rg` to list of allowed commands
+f4e1de2 2025-08-12 Update agent prompt
+a0e3ee8 2025-08-01 Use Aider's 'ORIGINAL/UPDATED' patch format
+9a65d07 2025-08-01 Create variables for various repeated REPL outputs
+17a4057 2025-07-30 Update ,push to only print output in agent mode
+b31c98e 2025-07-27 Fixed 'exec: handles commands with non-zero exit'
+fb0d60f 2025-07-27 Fixed 'rot: 5.txt should not be followed by 6.txt'
+e86e9f8 2025-07-27 Fixed test 'drop: middle file no longer in stack'
+c776204 2025-07-27 Fixed test 'drop: bottom file no longer in stack'
+d4c7d84 2025-07-27 Fixed test 'drop: top file no longer in stack ...'
+0c7421b 2025-07-26 Get multi-line edit test passing
+6cd5173 2025-07-26 Have `make dist` generate a public CHANGELOG
+1df6343 2025-07-26 Update Makefile prompt stripping script regex
+ed522de 2025-07-26 Add test files to `make dist` output
+1103f5b 2025-07-26 Ignore '<|end_of_sentence|>' output by e.g. R1
+a9cbd40 2025-07-26 Ignore '<|end_of_sentence|>' output by e.g. R1
+8d9e4ff 2025-07-26 Update ,push to add ERROR log output, early exit
+f9ef226 2025-07-26 Don't allow agent to add dupe files to context
+efbb0e3 2025-07-26 Update agent prompt instructions
+b475f6f 2025-07-23 Add missing agent convo global var
+a81fed0 2025-07-23 Update agent mode with Gemini feedback
+a06476a 2025-07-23 Try harder to process multi-line agent commands
+6e0c12e 2025-07-23 Use less strict AGENT_COMPLETE matching
+43b7def 2025-07-23 Tweak ,apply_patch output
+dca386d 2025-07-23 Whoops, use the right API key
+1d13f76 2025-07-23 Agent mode no longer uses @context stack
+bbc8dd2 2025-07-23 Define a key in Emacs for `synergy-cd`
+1e8a4bb 2025-07-23 Push ,comment output to convo history as well
+5e4da52 2025-07-23 Push command outputs into conversation history
+9584725 2025-07-23 Push last `@convo` element to agent convo as well
+d5f6a22 2025-07-23 Warn if user has already run an identical command
+63102a7 2025-07-23 Warn if user already has a file in context
+13db1ad 2025-07-23 Fix incorrect API backend choice
+28a0672 2025-07-23 Update agent loop to include command outputs
+42743f1 2025-07-23 Tweak agent prompt
+950ff7f 2025-07-23 Don't allow ,push of duplicate files to context
+8020758 2025-07-21 Move agent convo history into agent system prompt
+54450f8 2025-07-20 Match 'AGENT_COMPLETE' even in multi-line outputs
+fed51a8 2025-07-20 Make agent instructions even more emphatic
+d8ac253 2025-07-20 `find` is no longer a supported ,exec command
+998cfc3 2025-07-20 Use a more pronounced conversation separator
+d91adf6 2025-07-20 Update ,apply_patch help text, AGAIN
+0d95861 2025-07-20 Not all models accept 'temperature' arg
+e5e6652 2025-07-20 Update ,apply_patch instructions for agents
+38b6d3f 2025-07-20 Don't put files edited by ,apply_patch in context
+1c3381e 2025-07-20 Fix bugs in Dumper output
+6da7e0e 2025-07-20 Tweak ,apply_patch instructions for the agent
+ab3ab48 2025-07-20 Update help text for ,apply_patch
+e23686f 2025-07-19 Change agent ,apply_patch output in VERBOSE mode
+047824a 2025-07-19 Count tokens during agent API calls as well
+e69d40a 2025-07-19 Add ,peek output to convo history
+df60d03 2025-07-19 Retry API calls for up to 64 seconds
+1db704f 2025-07-19 Push files edited by ,apply_patch onto context
+1318b41 2025-07-19 Type agent output slightly faster
+ba1715b 2025-07-19 Add REPL command outputs to the convo history
+8d3c2ff 2025-07-19 Allow agent to issue multi-line ,apply_patch diffs
+495ec85 2025-07-19 Add more explicit agent instructions
+c543f24 2025-07-19 Update agent prompt with correct apply_patch info
+2c605da 2025-07-19 First ~working version of ,agent command (!!)
+aeca0aa 2025-07-19 First draft of ,agent command, with MANY BUGS
+ce3a85c 2025-07-18 Define the API key in one place
+2f15914 2025-07-12 ,reset N drops history after element at index N
+81500f5 2025-07-11 Use variable(s) for *all* REPL prompt references
+174d78b 2025-07-11 Add REPL commands to chat history
+acafd1f 2025-07-11 Update ,help output (and some POD)
+ce8c8ce 2025-07-10 Move some dump files
+8cf8c24 2025-07-09 Update SYNERGY system prompt
+db8e0da 2025-07-09 Add more tests for ,apply_patch
+255be9e 2025-07-08 Add a ,comment REPL command (for reasoning output)
+52ee868 2025-07-07 Add `make` to allowed ,exec commands
+dace70d 2025-07-06 ,apply_edits is now ,apply_patch
+cfa6bc2 2025-07-06 Remove mostly useless ,run command
+845cecb 2025-07-06 Add more info to ,exec output context
+acd4358 2025-07-05 Reduce list of commands supported by ,exec
+56cbf16 2025-07-05 Update logging to be per-process+timestamp
+c8e180d 2025-07-05 Update 'Cut the Knot' dump file
+c16532f 2025-07-05 Mark ,exec command and autodump mode as DONE
+60c107f 2025-07-05 Make ,history output more structured
+0171a7a 2025-07-02 Automatically save any active dump files
+49a3508 2025-07-02 Add Ctrl-C handler to confirm REPL exit
+7d80baf 2025-06-28 Support multi-line edits in ,apply_edits command
+83a1128 2025-06-28 Add basic ,apply_edits REPL command, with tests
+3c9b62b 2025-06-28 Add documentation for the ,exec REPL command
+404e36c 2025-06-28 Save chat logs re: ,apply_edits REPL command
+16ce536 2025-06-27 Add notes/ directory, with various files
+afdf788 2025-06-27 Add ,exec command, and various E2E tests
+2a557e1 2025-06-27 Add dump file for 'agent mode' design convo
+a227411 2025-06-20 Fix bug where ,swap on empty stack crashed
+4f6241f 2025-06-20 Add tests for ,swap and ,rot (and fix ,rot bug!)
+0005b22 2025-06-14 Typing `make` runs tests and installs
+59868c1 2025-06-14 Exercise e2e dump/load convo restore a bit more
+f7d1f2c 2025-06-14 Add e2e tests for XML dump file formats v1, v2
+06ffffe 2025-06-14 Move SYNERGY-PUSH in Elisp file; add keybinding
+6b9c2d9 2025-06-14 Add tests for ,drop command
+d579064 2025-06-12 Add first batch of end-to-end tests
+16049ad 2025-06-12 Update prompt with feedback from Claude
+fc75a3a 2025-06-04 Switch to Claude Sonnet 4 as default model
+430f757 2025-06-04 SYNERGY accepts commands over stdin now
+778382e 2025-05-30 Log session IDs and process IDs separately
+90c9cd7 2025-05-30 Increase retry backoff wait times
+968fb0d 2025-05-30 Go back to Claude 3.7 Sonnet, 3.5 Haiku bcs $$$
+1dec5d9 2025-05-30 Add ,run command to the REPL
+7c16529 2025-05-29 Use different (Claude 4) chat & summary models
+d96329e 2025-05-29 The ,clear command is now ,reset
+a82dbf7 2025-05-28 Update SYNERGY-PUSH to strip more special chars
+2559b8f 2025-05-21 Make it so every chat has a "session ID" (UUID)
+aa57f3c 2025-05-21 Make API requests retryable, w/exponential backoff
+21a56cd 2025-05-21 Prevent API errors by encoding convo, context
+8c9329d 2025-05-21 emacs: handle uniquified buffer names with slashes
+9ca4ad3 2025-05-20 Fix crash when base64 encoding UTF-8
+136e0ce 2025-05-16 Dump files use base64 for roundtripping
+ea4983d 2025-05-16 Use SYNERGY_ROOT env var for setting the root dir
+a6d337b 2025-05-15 Remove unused 'rank files by a heuristic' code
+9c0b6a0 2025-05-14 Update make dist to strip system prompt
+f25b6c8 2025-05-14 Fix Makefile
+a07039e 2025-05-14 Prompt uses EOPROMPT markers
+77fe35e 2025-05-14 Use latest Claude 3.7 by default
+a7e08fd 2025-05-13 Various makefile improvements
+922353b 2025-05-13 Only generate README.pod when making tarballs
+06489d3 2025-05-13 Only generate MANIFEST as part of tarballs
+f2366a5 2025-05-13 Finish updating system prompt per obra/claude.md
+eeb6485 2025-05-12 Update system prompt a bit based on obra/claude.md
+9229f1e 2025-05-09 Update help output, and copy to perldoc
+e38ab66 2025-05-09 Add more things to `make dist` output
+7deb7ef 2025-05-09 Add `make manifest` target
+c322d23 2025-05-09 Add `make dist` target; include README.pod
+813af7b 2025-05-09 Move mcl-related things to a subdir
+2e3cfa1 2025-05-09 Save some sessions
+eb7e685 2025-05-07 Update mcl spec
+b7f4333 2025-05-07 Delete old system prompt txt file
+354d6ef 2025-05-06 inf-synergy: strip more special chars from fnames
+c9eb7fb 2025-04-25 Add convo dump re: D&O skills taxonomy
+c767a44 2025-04-25 SYNERGY-PUSH-REGION: strip '*' from buffer names
+f88f347 2025-04-25 Update synergy perldoc to match REPL help output
+c64d743 2025-04-24 The REPL ,push command now adds directory listings
+673831b 2025-04-24 Tweak output of REPL ,load command
+d81ddcf 2025-04-21 Update mcl spec a little
+a535534 2025-04-19 Add `synergy-mcl-mode` lang highlighting for Emacs
+cb55380 2025-04-18 Start first draft of MCL language design doc
+f55f49f 2025-04-18 Add ,clear REPL command which empties file context
+9f644a7 2025-04-18 Tweak 'SYNERGY > ' assistant output when not stdin
+bbacd34 2025-04-18 Make Synergy ,pwd check more robust using `stat`
+6d645e4 2025-04-18 Update SYNERGY-CD to set Emacs `default-directory`
+2f77a04 2025-04-18 Update the context stack output in the REPL
+f61093b 2025-04-18 Update SYNERGY-PUSH-REGION to use buffer file name
+51e2082 2025-04-18 Add Emacs porcelain for ,cd REPL command
+13984f9 2025-04-17 Add Synergy REPL commands ,pwd and ,cd
+6b9168d 2025-04-17 Add tab complete of filenames to comint REPL
+27b2f0a 2025-04-17 Add docs for ,model command
+57a6e9c 2025-04-17 Add a ,model command to Synergy REPL
+65dedb2 2025-04-16 Save a couple of convo dump files
+5aaf078 2025-04-12 save 'periscope' design convo
+a284348 2025-04-11 Dump convo re: websockets from emacs to browser
+161b23f 2025-04-11 Have Gemini 2.5 Pro refine system prompt (again)
+03e6ab5 2025-04-11 Have Gemini 2.5 Pro refine system prompt (again)
+4c15c6a 2025-04-11 Have Gemini 2.5 Pro refine system prompt
+ff74704 2025-04-11 Update system prompt per Gemini 2.5 Pro feedback
+37ba0d5 2025-04-08 Save AI assistant design dump file
+8576ed5 2025-04-08 synergy: Update docs to be backend-agnostic
+915dada 2025-04-08 synergy: replace non-ascii chars in file context
+c243348 2025-04-08 inf-synergy: Add required time-stamp lib import
+31d195b 2025-03-21 Make `synergy-push*` work in `locate-mode` buffers
+34ee152 2025-03-13 Add first implementation of ,collect
+44db119 2025-03-13 Don't sanitize filenames for ,dump
+11575ef 2025-03-12 Print API error message before retrying
+e20ecea 2025-03-12 Add system prompt back to script file (for now)
+c04b7cd 2025-03-12 Add system prompt as separate file
+845e72a 2025-03-08 Update README
+f859046 2025-03-08 Update interactive help text
+4c9a189 2025-03-08 Update how we generate tarballs
+515f1ef 2025-03-08 Fix bug loading dump file from subdirectories
+c33b53f 2025-03-08 Add back ,history command
+40aed55 2025-03-08 Read system prompt from file; change chat log dir
+5eafd1a 2025-03-08 Move chat logs into var/log subdirectory
+d8c4532 2025-03-07 Add rough implementations of ,dump and ,load
+573d00a 2025-03-07 Add try/catch block around API calls
+d55023a 2025-03-06 Update Makefile to generate tarball
+9578734 2025-03-06 Generate new README
+a91b251 2025-03-06 Update synergy POD docs
+247fe56 2025-03-06 Ignore more things
+ca40eec 2025-03-05 Update MANIFEST
+ab4630c 2025-03-05 Check POD syntax before making README
+ba7d5fd 2025-03-05 Make a proper POD README
+1e20aa7 2025-03-05 Update logfile location
+cb4ae82 2025-03-03 Update system prompt again, using Claude-3.5-haiku
+9e94a92 2025-03-03 Copy code blocks without language names, too
+324c15f 2025-03-03 Update sysprompt with Claude 3.5-haiku feedback
+4c8be1b 2025-03-03 Update system prompt with Gemini feedback (2)
+97ad408 2025-03-03 Update system prompt with Gemini feedback
+8d5bc40 2025-03-03 Fix chat .md formatting
+07e54e5 2025-03-03 Update README
+8e8e2c0 2025-03-02 "Fix" the prompt output bug (finally???)
+6a14f21 2025-03-01 Add SYNERGY-COPY-CODE-BLOCK
+8327198 2025-02-28 Update MANIFEST
+776a151 2025-02-28 Add SYNERGY-PUSH which wraps region, buffer, dired
+ef93393 2025-02-28 Add SYNERGY-PUSH-DIRED-MARKED-FILES
+2fe336f 2025-02-28 Ensure COMINT-SEND-STRING sends another newline
+01a7960 2025-02-28 Add ,peek command for viewing file stack entries
+23809c5 2025-02-28 Command ,stack is now ,s (FORTH-inspired)
+9228162 2025-02-28 Add commands ,swap ,rot
+4662a61 2025-02-28 SYNERGY-PUSH-BUFFER messages even when file exists
+2e7a16c 2025-02-28 SYNERGY-PUSH-REGION sleeps so temp file can write
+59713bc 2025-02-28 Add SYNERGY-PUSH-* commands to Emacs
+58ba756 2025-02-28 Make ,stack output nicer
+d5b10a8 2025-02-28 Update prompt with math/coding, reasoning chains
+8e20001 2025-02-27 Update comments in Elisp file
+bd27292 2025-02-27 Update system prompt based on AI feedback
+cd6c6bc 2025-02-26 Update system prompt with assistant feedback
+905d183 2025-02-26 Log using variable names, not hardcoded strings
+1e2a3d5 2025-02-26 Try not to print 'SYNERGY >' after ,foo commands
+ad4cf2e 2025-02-26 Add ,tokens command
+d0f56b3 2025-02-26 Don't print 'SYNERGY > ' after ,foo commands
+5f3ee17 2025-02-26 Tweak help text
+94c0d68 2025-02-26 Update command processor ,help documentation
+d73c097 2025-02-26 Remove redundant ,context command
+dfab68f 2025-02-26 Switch back to Claude 3.5 (much cheaper)
+e8abeb2 2025-02-26 Upgrade to Claude 3.7
+898b789 2025-02-26 Modify ,push command; add ,pop ,stack ,exit
+5cae184 2025-02-26 Tweak system prompt history & context
+3569bbd 2025-02-26 Tweak how files are represented on context stack
+e8d9056 2025-02-25 Add ,push system command; modify system prompt
+8aedd1c 2025-02-25 Add ,context system command
+435eab5 2025-02-25 Add ,prompt system command
+ac8f409 2025-02-24 Tweak system prompts to get it to ask more q's
+381990a 2025-02-24 Tweak prompt slightly w.r.t. file context
+24e06f1 2025-02-24 Update command help text
+facb5e3 2025-02-21 start implementing command mode
+5ab5ef4 2025-02-21 add (thus far empty) context variable to the chat
+e29781a 2025-02-21 move windows comint tweaks into mode definition
+0e9fc6f 2025-02-21 drop the 'send-region' stuff
+eb0f516 2025-02-21 add manifest
+19381b8 2025-02-21 makefile cleans more things
+606a9bc 2025-02-21 add checksum/manifest to makefile
+fe3bea6 2025-02-21 update readme
+291fcad 2025-02-21 add more chat logs
+d35ff76 2025-02-15 Just log stuff here so it's synced using Dropbox
+065e5a5 2025-02-12 I'm not sure 'quotemeta' is really necessary
+96c2d98 2025-02-12 Be a good citizen when used in a shell pipe
+2b09e48 2025-02-10 macOS must be able to find `perl`
+cb8081e 2025-02-10 Fix broken makefile syntax
+9d7f02c 2025-02-09 Ignore more things
+bc0d800 2025-02-09 Get things working better on Windows
+ea6269d 2025-02-09 Add some DEBUG/VERBOSE flags
+9f6b142 2025-02-09 Fix bug where just hitting enter would crash REPL
+262e126 2025-02-09 Shorten system prompt
+bf077e4 2025-02-09 Save more chat history
+5ea1007 2025-02-07 Add a relative importance heuristic for context
+6ab4283 2025-02-07 Add some more chat history
+e929c2d 2025-02-06 Have SYNERGY-INPUT-SENDER finish with a newline
+60f5ba3 2025-02-05 Add custom comint input sender for multiline
+9f2e5c4 2025-02-05 Tweak inferior-synergy-mode prompt regexp
+9a03e08 2025-02-05 Store (some) prompt strings in variables
+ee441c0 2025-02-05 Remove the broken 'send region to Synergy' stuff
+83fa2de 2025-02-04 Update makefile with new elisp file name
+7829144 2025-02-03 Finish moving to 'inf-synergy'; add docs
+48161ae 2025-02-03 It's now `inferior-synergy-mode'
+df54fbe 2025-02-03 Move some functions around
+1d48ce9 2025-02-03 Port more features from scheme-mode
+9a9b565 2025-02-03 Slap in some more chat history
+bc74689 2025-02-03 Ignore more things
+3dad098 2025-02-03 Append to a local log file (in .md format)
+e496030 2025-01-31 Add more chat output
+3511904 2025-01-31 Emacs synergy shell saves inputs to file on exit
+c76c3f8 2025-01-31 Delete silly AI-generated code :-/
+f1c2d69 2025-01-31 Add Makefile and Emacs Lisp shell-mode style UI
+ddf18f9 2025-01-31 Update README
+ecbe3ab 2025-01-31 Give synergy all context from current conversation
+07a15b3 2025-01-31 Add first draft of 'synergy' CLI shell
+0740eaa 2025-01-31 Fix erroneous square bracket usage
+f6bf749 2025-01-31 Light, Let There Be

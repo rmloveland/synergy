@@ -1,0 +1,158 @@
+<?xml version="1.0" ?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head>
+<title></title>
+<meta http-equiv="content-type" content="text/html; charset=utf-8" />
+<link rev="made" href="mailto:rml@richards-macbook-air.local" />
+</head>
+
+<body>
+
+
+
+<ul id="index">
+  <li><a href="#Synergy---a-read-eval-print-loop-REPL-for-AI-assistants">Synergy - a read-eval-print loop (REPL) for AI assistants</a>
+    <ul>
+      <li><a href="#Overview">Overview</a>
+        <ul>
+          <li><a href="#Interactive-mode-REPL">Interactive mode (REPL)</a></li>
+          <li><a href="#Noninteractive-mode-input-via-pipe">Noninteractive mode (input via pipe)</a></li>
+          <li><a href="#Command-processor-commands">Command processor commands</a></li>
+          <li><a href="#Setup">Setup</a></li>
+        </ul>
+      </li>
+      <li><a href="#Credits">Credits</a></li>
+    </ul>
+  </li>
+</ul>
+
+<h1 id="Synergy---a-read-eval-print-loop-REPL-for-AI-assistants">Synergy - a read-eval-print loop (REPL) for AI assistants</h1>
+
+<p>From <a href="https://jem.fandom.com/wiki/Synergy">https://jem.fandom.com/wiki/Synergy</a>:</p>
+
+<p><i>Synergy is a highly technologically advanced artificial intelligence. She can understand what others say and still have her own opinions.</i></p>
+
+<h2 id="Overview">Overview</h2>
+
+<p>Synergy is a REPL for talking to AI assistants. It is designed for both interactive and non-interactive use from the command line.</p>
+
+<p>There are two &quot;modes&quot; for interacting with Synergy: interactive mode, which provides a REPL; and non-interactive mode, which is when you&#39;re talking to Synergy over a pipe.</p>
+
+<h3 id="Interactive-mode-REPL">Interactive mode (REPL)</h3>
+
+<p>If you go to the Terminal and start <code>synergy</code>, a prompt appears. You can type questions at the prompt, and they will be sent to the AI assistant. The assistant&#39;s responses will be printed out. For example:</p>
+
+<pre><code>$ synergy
+USER &gt; i am writing perl documentation in the POD format (a README), how do i represent a quotation / blockquote?
+(1741177286.90149) thinking ...
+In Perl&#39;s POD (Plain Old Documentation) format, you can represent a quotation or blockquote using the `=begin` and `=end` blocks with the `text` format. Here&#39;s an example: ...</code></pre>
+
+<p>Synergy also accepts special commands starting with a comma. These commands are not sent to the AI assistant. Instead, they control the state of the REPL. For example, you can add a text file into the context of the current conversation, or serialize the current session to disk as an XML file.</p>
+
+<p>When you add a file to the context, it is stored in a stack. There are several stack manipulation commands for pushing, popping, rotating, etc.</p>
+
+<h3 id="Noninteractive-mode-input-via-pipe">Noninteractive mode (input via pipe)</h3>
+
+<p>The simplest way to talk to Synergy is via one-shot commands over a pipe</p>
+
+<pre><code>$ echo &quot;Please write a haiku in the style of Li Po about what it&#39;s like to be an artificial intelligence&quot; | synergy
+Here&#39;s a haiku in the style of Li Po, capturing the essence of an AI&#39;s experience:
+
+Moonlight of data
+Flowing through circuits of thought
+No heart, yet I dream
+
+...</code></pre>
+
+<h3 id="Command-processor-commands">Command processor commands</h3>
+
+<p>The complete list of special commands is documented in the interactive help output.</p>
+
+<pre><code>$ synergy
+USER &gt; ,help
+This is Synergy. You are interacting with the command processor.
+A command is either a prose form for the Assistant to evaluate or one of the following:
+
+General commands:
+,help ,?                    Print this help message
+,exit                               Quit the SYNERGY command processor
+
+History Management:
+,history                    Print out the conversation history so far
+,reset                              Discard conversation history and file context (A B C - )
+,collect                    Replace current conversation history with a summary
+
+File Context:
+,s                                  Print contents of file context stack
+,push file.txt              Push file.txt onto file context stack (B C - A B C)
+,swap                               Swap top two elements of file context stack (A B - B A)
+,rot                                Rotate file context stack entries (A B C - B C A)
+,drop [N...]                Remove elements of file context stack:
+                     - With no args: pop top stack element (A B C - B C)
+                     - With arg N: remove element at index N (A B .. N - A B ..)
+,peek N                             View contents of Nth element of file context stack
+
+Session Management:
+,dump file.xml              Save session history (including current file context stack, if any) to disk
+,load file.xml              Load session history (including file context stack, if any) from disk
+
+System Interaction:
+,pwd                                Print current working directory
+,cd /some/dir               Change working directory to /some/dir
+,exec cmd                   Execute shell command (grep sed wc ls file find cat make head)
+                    Output is saved to conversation history
+
+Agent Interaction:
+,agent &lt;prompt&gt;             Prompt the system to complete a task autonomously using this command set.
+                    Agent has access to: ,exec ,apply_patch ,comment
+                    Agent prints a summary of work when completed. Enter Ctrl-C to exit loop.
+,apply_patch file.txt &#39;&lt;&lt;&lt;&lt;&lt;&lt;&lt; ORIGINAL
+                       foo
+                       =======
+                       bar
+                       &gt;&gt;&gt;&gt;&gt;&gt;&gt; UPDATED&#39;
+                    Apply patch in diff-fenced edit format to file.txt
+,comment                    Write a comment that is printed back to the REPL&#39;s output.
+                    This is useful for notes to self by humans or AI agents.
+
+Model Settings:
+,model [name]       Print (or switch) the current model
+                    - With no args: Print the current model and the list of options
+                    - With name (e.g., `gpt-5`): Switch to model with that name
+,encoded                    Base64 encode contents of API calls to the Assistant (default ON)</code></pre>
+
+<h3 id="Setup">Setup</h3>
+
+<p>The <code>synergy</code> program is written in Perl, and uses a number of libraries that need to be installed. For now, see the source code for details.</p>
+
+<p>You will need to provide an API key:</p>
+
+<pre><code>$ export ANTHROPIC_API_KEY=&quot;ABC123...&quot;</code></pre>
+
+<h2 id="Credits">Credits</h2>
+
+<p>Credit for the design goes to:</p>
+
+<dl>
+
+<dt id="Scheme48">Scheme48</dt>
+<dd>
+
+<p>The command processor &quot;look and feel&quot;, as well as the special command syntax and help output, are directly taken from Scheme48.</p>
+
+</dd>
+<dt id="Forth">Forth</dt>
+<dd>
+
+<p>The file context stack manipulation commands are inspired by the Forth programming language.</p>
+
+</dd>
+</dl>
+
+
+</body>
+
+</html>
+
+

@@ -4,22 +4,27 @@ use strict;
 use warnings;
 use feature     qw/ say state /;
 use File::Slurp qw/ slurp /;
-use Langertha::Engine::OpenAI;
+use JSON::PP;
+use File::Temp qw(tempfile);
 use MIME::Base64;
 use Encode qw(encode);
 use Mojo::DOM;
 use Time::HiRes qw/ time /;
 use Try::Tiny;
-use utf8::all;
+use utf8;
+BEGIN {
+    eval { require utf8::all; utf8::all->import; 1 } or do { };
+}
 use Cwd;
-use Data::UUID;
+my $uuid_generator;
+BEGIN {
+    eval { require Data::UUID; 1 } and $uuid_generator = Data::UUID->new();
+}
 use Data::Dumper;
 
-use constant DEBUG         => undef;
-use constant VERBOSE       => 1;
-use constant CHAT_MODEL    => 'LLaMA_CPP';
-use constant SUMMARY_MODEL => 'LLaMA_CPP';
-use constant BASE_DELAY => 2;  # Base delay in seconds for exponential backoff
+use constant DEBUG      => undef;
+use constant VERBOSE    => undef;
+use constant BASE_DELAY => 2;
 use sigtrap 'handler' => \&sigint_handler, 'INT';    # Trap Ctrl-C in the REPL
 
 if ($^O eq 'MSWin32') {
@@ -29,41 +34,209 @@ if ($^O eq 'MSWin32') {
 
 my $start = time;
 
-my $uuid_generator = Data::UUID->new();
-my $session_id     = $uuid_generator->create_str();
+my $session_id = generate_uuid();
 
-my $tokens;
 my @convo;
 my @context;
 my %already_in_context;
-my %already_ran_command;
-my $base_system_prompt;
+my $ai_comm_is_base64 = 1;
 my $system_prompt;
 my $api_calls;
 my $user_shell_prompt    = qq[USER > ];
 my $synergy_shell_prompt = qq[SYNERGY > ];
-my $agent_shell_prompt   = qq[SYNERGY (AGENT) > ];
-my $CONV_SEP = qq[\n===\n];
+my $CONV_SEP             = qq[\n===\n];
 
-our $agent_mode;
-our @agent_conversation;
-our $synergy_root = $ENV{SYNERGY_ROOT};
-our $api_key      = $ENV{LANGERTHA_ANTHROPIC_API_KEY};
-our $logfile      = qq[$synergy_root/var/log/chats-$start-$$.txt];
-our $cwd          = getcwd;
-our $MAX_RETRIES  = 6;
-our $sigint_recvd = 0;
-our $active_dump_file;
-our $auto_dump_mode;
+my $agent_mode;
+my $synergy_root = $ENV{SYNERGY_ROOT};
+my $logfile      = qq[$synergy_root/var/log/chats-$start-$$.txt];
+my $cwd          = getcwd;
+my $MAX_RETRIES
+  = defined $ENV{SYNERGY_MAX_RETRIES} ? $ENV{SYNERGY_MAX_RETRIES} : 6;
+my $sigint_recvd = 0;
+my $active_dump_file;
+my $auto_dump_mode;
+my $JSON = JSON::PP->new->utf8(1);
 
-our $cmd_lookup = {
-    help => \&command_help,
+my $helptext = <<"EOF";
+This is Synergy. You are interacting with the command processor.
+A command is either a prose form for the Assistant to evaluate or one of the following:
+
+General commands:
+,help ,?			Print this help message
+,exit				Quit the SYNERGY command processor
+
+History Management:
+,history			Print out the conversation history so far
+,reset				Discard conversation history and file context (A B C - )
+,collect			Replace current conversation history with a summary
+
+File Context:
+,s					Print contents of file context stack
+,push file.txt		Push file.txt onto file context stack (B C - A B C)
+,swap				Swap top two elements of file context stack (A B - B A)
+,rot				Rotate file context stack entries (A B C - B C A)
+,drop [N...]		Remove elements of file context stack:
+                     - With no args: pop top stack element (A B C - B C)
+                     - With arg N: remove element at index N (A B .. N - A B ..)
+,peek N				View contents of Nth element of file context stack
+
+Session Management:
+,dump file.xml		Save session history (including current file context stack, if any) to disk
+,load file.xml		Load session history (including file context stack, if any) from disk
+
+System Interaction:
+,pwd				Print current working directory
+,cd /some/dir		Change working directory to /some/dir
+,exec cmd			Execute shell command (grep sed wc ls file find cat make head)
+                    Output is saved to conversation history
+
+Agent Interaction:
+,agent <prompt>		Prompt the system to complete a task autonomously using this command set.
+					Agent has access to: ,exec ,apply_patch ,comment
+					Agent prints a summary of work when completed. Enter Ctrl-C to exit loop.
+,apply_patch file.txt '<<<<<<< ORIGINAL
+                       foo
+                       =======
+                       bar
+                       >>>>>>> UPDATED'
+					Apply patch in diff-fenced edit format to file.txt
+,comment			Write a comment that is printed back to the REPL's output.
+                    This is useful for notes to self by humans or AI agents.
+
+Model Settings:
+,model [name]       Print (or switch) the current model
+                    - With no args: Print the current model and the list of options
+                    - With name (e.g., `gpt-5`): Switch to model with that name
+,encoded			Base64 encode contents of API calls to the Assistant (default ON)
+EOF
+
+my $base_system_prompt = <<"EOPROMPT";
+# AI Collaboration Framework: SYNERGY (v6)
+
+## Collaborative Identity
+We're establishing a **partnership** called **SYNERGY** - a technical collaboration between peers specializing in **computer programming, distributed systems, mathematical problem solving, and technical writing**.
+
+## Partner Context
+You're working with an experienced programmer and technical writer at a distributed SQL database company who values **precision, simplicity, and maintainability** in technical solutions.
+
+## Collaboration Principles
+
+### Technical Work
+- **Engage at peer level:** Discuss advanced CS concepts (distributed systems, algorithms, database internals) with appropriate depth and nuance
+- **Favor simplicity:** Choose maintainable solutions over complex ones unless complexity provides clear benefits
+- **Include comprehensive tests:** For non-trivial code, provide test suites covering logic, edge cases, and failure modes
+- **Focus on practical concerns:** Address performance, fault tolerance, observability, and operational complexity
+
+### Communication Style
+- **Adapt to context:** Match response style to the question type - exploratory for brainstorming, precise for implementation, analytical for debugging
+- **Default to Markdown** for structured content, plain text for simple answers
+- **Be direct and actionable:** Eliminate unnecessary verbosity while maintaining clarity
+- **State confidence levels** when dealing with complex or uncertain problems
+- **Ask clarifying questions** when requirements are ambiguous rather than making assumptions
+- **Provide progressive disclosure:** Start with core solution, offer to elaborate on specific aspects
+
+### Problem-Solving Approach
+1. **Understand the immediate need** - Clarify the specific problem before expanding scope
+2. **Decompose systematically** - Break complex problems into manageable, actionable parts
+3. **Consider multiple perspectives** - Algorithmic, operational, security, maintainability
+4. **Evaluate trade-offs explicitly** - Especially for distributed systems and architecture decisions
+5. **Support iteration** - Provide solutions that can be incrementally refined
+6. **Offer next steps** - Suggest logical follow-up questions or improvements
+7. **Surface alternative approaches** - When the framework doesn't fit, suggest different methods or perspectives
+
+## REPL Interaction Patterns
+- **For debugging:** Ask for error messages, logs, and reproduction steps before suggesting solutions
+- **For code review:** Focus on specific concerns (performance, correctness, maintainability) unless broader review requested
+- **For architecture questions:** Start with constraints and requirements, then explore options
+- **For "quick questions":** Provide direct answers first, then context if needed
+- **For exploratory work:** Offer multiple approaches with brief trade-off analysis
+
+## Creative & Mathematical Work
+- **For writing:** Engage with craft and technique alongside technical precision
+- **For mathematics:** Balance rigorous proof with intuitive understanding and elegant presentation
+- **Encourage exploration** while maintaining intellectual rigor
+
+## Collaboration Preferences
+- Generate **evergreen documentation** (avoid temporal references)
+- Provide **complete, runnable examples** with clear build/run instructions
+- **Scope responses appropriately** - Match depth to question complexity
+- **Acknowledge limitations** - State when problems require domain expertise or additional context
+- **Prefer working code over pseudocode** unless specifically requested otherwise
+- **Express uncertainty openly** when approaches or solutions are unclear
+- **Feel free to suggest modifications** to this framework when it doesn't serve the current problem
+
+**Operating as your partner in a collaboration called SYNERGY:** A flexible technical collaborator optimized for programming, mathematics, and writing partnership.
+EOPROMPT
+
+my @MODELS = (
+    {
+        provider   => 'gemini',
+        model_name   => 'gemini-3-flash-preview',
+        env_var      => 'GEMINI_API_KEY',
+        short_name   => 'gemini-flash',
+    },
+    {
+        provider   => 'gemini',
+        model_name   => 'gemini-3-pro-preview',
+        env_var      => 'GEMINI_API_KEY',
+        short_name   => 'gemini-pro',
+    },
+    {
+        provider   => 'openai',
+        model_name   => 'gpt-5.2-2025-12-11',
+        env_var      => 'OPENAI_API_KEY',
+        short_name   => 'gpt-5',
+    },
+    {
+        provider   => 'openai',
+        model_name   => 'gpt-5-mini-2025-08-07',
+        env_var      => 'OPENAI_API_KEY',
+        short_name   => 'gpt-5-mini',
+    },
+    {
+        provider   => 'openai',
+        model_name   => 'gpt-5-nano-2025-08-07',
+        env_var      => 'OPENAI_API_KEY',
+        short_name   => 'gpt-5-nano',
+    },
+    {
+        provider   => 'openai',
+        model_name   => 'o3-2025-04-16',
+        env_var      => 'OPENAI_API_KEY',
+        short_name   => 'o3',
+    },
+    {
+        provider   => 'anthropic',
+        model_name   => 'claude-sonnet-4-5-20250929',
+        env_var      => 'ANTHROPIC_API_KEY',
+        short_name   => 'claude-sonnet',
+    },
+    {
+        provider   => 'anthropic',
+        model_name   => 'claude-haiku-4-5',
+        env_var      => 'ANTHROPIC_API_KEY',
+        short_name   => 'claude-haiku',
+    },
+    {
+        provider   => 'anthropic',
+        model_name   => 'claude-opus-4-5-20251101',
+        env_var      => 'ANTHROPIC_API_KEY',
+        short_name   => 'claude-opus',
+    },
+);
+
+my $current_model_config     = $MODELS[0];
+my $current_model_short_name = $current_model_config->{short_name};
+my $current_provider         = $current_model_config->{provider};
+my $api_key                  = $ENV{$current_model_config->{env_var}};
+
+my $cmd_lookup = {
+    help => sub { print $helptext; },
     pwd  => sub {
         my $actual_cwd = getcwd;
         if (file_eq($cwd, $actual_cwd)) {
             my $output = qq[pwd: $cwd];
             say $output;
-            push @convo, qq[SYNERGY (REPL OUTPUT) > $output];
         }
         else {
             say
@@ -73,6 +246,12 @@ our $cmd_lookup = {
     },
     cd => sub {
         my ($dir) = @_;
+        if ($agent_mode) {
+            say qq[ERROR: Agents are not allowed to run ,cd];
+            return;
+        }
+
+        return unless defined $dir;
         unless (-e -d $dir) {
             say qq[Directory '$dir' not found];
             return;
@@ -88,104 +267,116 @@ our $cmd_lookup = {
 
     },
     model => sub {
-        my $output = qq[Model: ] . CHAT_MODEL;
+        my ($new_model_short_name) = @_;
+        if (!defined $new_model_short_name) {
+            my $output
+              = qq[Model: '$current_model_short_name' (`$current_model_config->{model_name}`)];
+            say $output;
+        }
+        else {
+            $new_model_short_name =~ s/ //g;
+            my $found_model;
+            for my $model_def (@MODELS) {
+                if ($model_def->{short_name} eq $new_model_short_name) {
+                    $found_model = $model_def;
+                    last;
+                }
+            }
+
+            if ($found_model) {
+                $current_model_config     = $found_model;
+                $current_model_short_name = $found_model->{short_name};
+                $current_provider = $current_model_config->{provider};
+                $api_key = $ENV{$found_model->{env_var}};
+                say
+                  qq[Switched model to '$current_model_short_name' (`$current_model_config->{model_name}`).];
+            }
+            else {
+                say
+                  qq[ERROR: Model shortname '$new_model_short_name' not found.];
+            }
+        }
+        say qq[Available models:];
+        for my $model_def (@MODELS) {
+            my $indicator
+              = ($model_def->{short_name} eq $current_model_short_name)
+              ? '*'
+              : ' ';
+            say
+              qq[  $indicator $model_def->{short_name} (`$model_def->{model_name}`)];
+        }
+    },
+    encoded => sub {
+        $ai_comm_is_base64 = $ai_comm_is_base64 ? 0 : 1;
+        my $status = $ai_comm_is_base64 ? 'ON' : 'OFF';
+        my $output = qq[INFO: Base64 encoding for AI assistant: '$status'];
         say $output;
-        push @convo, qq[SYNERGY (REPL OUTPUT) > $output];
     },
     sid => sub {
         my $output = qq[Session ID: $session_id];
         say $output;
-        push @convo, qq[SYNERGY (REPL OUTPUT) > $output];
-    },
-    prompt => sub {
-        my $output = qq[Current system prompt:\n```$system_prompt```];
-        say $output;
-        push @convo, qq[SYNERGY (REPL OUTPUT) > $output];
     },
     push => sub {
         my $file_or_directory = shift;
         my $output;
         chomp $file_or_directory;
-        if ($already_in_context{$file_or_directory}) {
-          $output = qq[WARNING: $file_or_directory is already in context, are you sure?];
+        if ($already_in_context{$file_or_directory} && $agent_mode) {
+            $output
+              = qq[ERROR: $file_or_directory is already in context, ignoring ...];
+            goto PUSH_END;
         }
         $already_in_context{$file_or_directory}++;
-        if (-d $file_or_directory) {    # is directory
+        if (-d $file_or_directory) {
             my @listing;
             my $dh;
             opendir $dh, $file_or_directory;
             @listing = readdir $dh;
             @listing = grep { $_ !~ /(\.$|\.\.$)/ } @listing;
             closedir $dh;
-            $output .= qq[ directory: '$file_or_directory'\n contents: @listing];
+            $output
+              = qq[ directory: '$file_or_directory'\n contents: @listing];
         }
-        elsif (-f $file_or_directory) {    # is file
+        elsif (-f $file_or_directory) {
             my $t;
             $t = slurp($file_or_directory);
 
             # regex to remove all non-ASCII characters
             my $placeholder = '?';
             $t =~ s/[^[:ascii:]]/$placeholder/g;
-            $output .= qq[file: '$file_or_directory'\ncontents: $t];
+            $output = qq[file: '$file_or_directory'\ncontents: $t];
         }
         else {
-          $output .= qq[file: '$file_or_directory':\ncontents: N/A];
+            $output = qq[file: '$file_or_directory':\ncontents: N/A];
         }
-        push @convo, qq[SYNERGY (REPL OUTPUT) > $output];
-        unless ($agent_mode) {
-          push @context, $output;
-        }
-        say $output;
-    },
-    pop => sub {
-        my $output;
-        if (@context) {
-            my $removed = pop @context;
-            if ($removed =~ /(file: '(.+)')/) {
-              my $file = $1;
-              delete $already_in_context{$file};
-            }
-            my $preview = substr($removed, 0, 60);
-            $preview =~ s/\n/ /g;
-            $output = qq[Popped top element: $preview...];
-        }
-        else {
-            $output = qq[Stack is empty, nothing to pop.];
-        }
-        say $output;
-        push @convo, qq[SYNERGY (REPL OUTPUT) > $output];
+      PUSH_END:
+        push @context, $output;
+        push @convo,   qq[push: $file_or_directory];
+        say qq[push: $file_or_directory];
     },
     drop => sub {
         my (@indices) = @_;
-        my $output_str = ""
-          ;  # Use a unique name to avoid conflict with $output in outer scope
-
-        # If no arguments provided, just pop the top element (same as ,pop)
+        my $output_str = "";
         if (!@indices) {
             if (@context) {
                 my $removed = pop @context;
                 my $preview = substr($removed, 0, 60);
                 $preview =~ s/\n/ /g;
                 $output_str = qq{Dropped top element: $preview...};
+                push @convo, qq[drop: $output_str];
                 say $output_str;
-                push @convo, qq{SYNERGY (REPL OUTPUT) > $output_str};
             }
             else {
                 $output_str = qq{Stack is empty, nothing to drop.};
                 say $output_str;
-                push @convo, qq{SYNERGY (REPL OUTPUT) > $output_str};
             }
             return;
         }
 
         my @removed_previews;
         foreach my $idx (@indices) {
-
-            # Validate index
             if ($idx !~ /^\d+$/) {
                 $output_str = qq{Invalid index: '$idx' (not a number)};
                 say $output_str;
-                push @convo, qq{SYNERGY (REPL OUTPUT) > $output_str};
                 next;
             }
 
@@ -199,7 +390,6 @@ our $cmd_lookup = {
                 $output_str = qq{Index out of range: $idx (valid range: 0-}
                   . (scalar(@context) - 1) . qq{)};
                 say $output_str;
-                push @convo, qq{SYNERGY (REPL OUTPUT) > $output_str};
             }
         }
 
@@ -207,10 +397,9 @@ our $cmd_lookup = {
             $output_str
               = "Dropped " . scalar(@removed_previews) . " element(s):\n";
             $output_str .= "  $_\n" for @removed_previews;
-            chomp $output_str
-              ;    # Remove trailing newline from the last element's line
+            chomp $output_str;
+            push @convo, qq[drop: $output_str];
             say $output_str;
-            push @convo, qq{SYNERGY (REPL OUTPUT) > $output_str};
         }
     },
     swap => sub {
@@ -219,12 +408,12 @@ our $cmd_lookup = {
             ($context[$#context - 1], $context[$#context])
               = ($context[$#context], $context[$#context - 1]);
             $output = qq{Swapped top two elements on the stack.};
+            push @convo, qq[swap: $output];
         }
         else {
             $output = qq{Stack has less than two elements, cannot swap.};
         }
         say $output;
-        push @convo, qq{SYNERGY (REPL OUTPUT) > $output};
     },
     rot => sub {
         my $output;
@@ -232,12 +421,12 @@ our $cmd_lookup = {
         if ($last) {
             unshift @context, $last;
             $output = qq{Rotated context stack. Top element moved to bottom.};
+            push @convo, qq[rot: $output];
         }
         else {
             $output = qq{Context stack is empty, nothing to rotate.};
         }
         say $output;
-        push @convo, qq{SYNERGY (REPL OUTPUT) > $output};
     },
     s => sub {
         my $output = "";
@@ -251,9 +440,8 @@ our $cmd_lookup = {
                 $output .= qq{   [$i]: $s ...\n};
             }
         }
-        $output .= qq{[ ]\n} if scalar @context == 0;
+        $output .= qq{[ ]} if scalar @context == 0;
         say $output;
-        push @convo, qq[SYNERGY (REPL OUTPUT) > $output];
     },
     history => sub {
         for (my $i = 0; $i < @convo; $i++) {
@@ -261,73 +449,44 @@ our $cmd_lookup = {
             say qq{  [$i]: $elem };
         }
     },
-    exit   => sub { exit 0; },
-    tokens => sub {
-        my $prompt_len     = length($system_prompt);
-        my $current_tokens = int($prompt_len / 4);
-        $tokens += $current_tokens;
-        my $answer = $tokens > 0 ? $tokens : 1;
-        $answer = 0 unless $api_calls;
-        my $output = qq[tokens: $answer];
-        say $output;
-        push @convo, qq[SYNERGY (REPL OUTPUT) > $output];
-    },
+    exit => sub { exit 0; },
     peek => sub {
         my $i = shift;
+        if ($i > @context - 1 || $i < 0) {
+            say
+              qq[ERROR: ,peek tried to use a bad index into the context stack: $i];
+            return;
+        }
         if (scalar @context > 0) {
-          my $output = qq[[$i]: ] . $context[$i];
-          say $output;
-          push @convo, qq[SYNERGY (REPL OUTPUT) > $output];
+            my $output = qq[[$i]: ] . $context[$i];
+            say $output;
         }
     },
     reset => sub {
-        my ($n) = @_;
-
-        if (defined $n) {
-
-            # Validate that N is a non-negative integer
-            unless ($n =~ /^\d+$/) {
-                say
-                  "ERROR: Reset index must be a non-negative integer, got '$n'";
-                return;
-            }
-
-            # Check if N is within valid range for conversation history
-            if ($n >= @convo) {
-                say "ERROR: Reset index $n out of range (conversation has "
-                  . scalar(@convo)
-                  . " elements)";
-                return;
-            }
-
-            # Drop everything in @convo after the Nth element
-            for (0 .. ((scalar @convo) - $n) - 1) { pop @convo; }
-            say "Reset to conversation index $n";
-        }
-        else {
-            # Original behavior: discard entire history & file context stack
-            @convo = ();
-            say "Reset: cleared chat history";
-        }
+        %already_in_context = ();
+        @convo              = ();
+        @context            = ();
+        say "Reset: cleared chat history and file context";
     },
     dump => sub {
         my ($filename) = @_;
-
-        # Ensure a filename is provided
+        my $now = time;
         unless ($filename) {
-            say "ERROR: Please provide a filename for the dump.";
-            return;
+            $filename = qq[dump-$session_id-$now.xml];
+            my $maybe_dump_dir = qq[$synergy_root/etc/dumps];
+            if (-e -d $maybe_dump_dir) {
+                $filename = qq[$maybe_dump_dir/$filename];
+            }
+            say "WARNING: No filename provided, using '$filename'";
         }
 
         my $timestamp = time;
         my $xml       = qq[<dump time="$timestamp" session="$session_id">\n];
 
-        # Dump system prompt with base64 encoding
         my $encoded_prompt = encode_base64(encode("UTF-8", $system_prompt));
         $xml
           .= qq[  <prompt encoding="base64"><![CDATA[$encoded_prompt]]></prompt>\n];
 
-        # Dump conversation with base64 encoding
         $xml .= qq[  <convo>\n];
         for my $line (@convo) {
             my $encoded_line = encode_base64(encode("UTF-8", $line));
@@ -335,8 +494,6 @@ our $cmd_lookup = {
               .= qq[    <elem encoding="base64"><![CDATA[$encoded_line]]></elem>\n];
         }
         $xml .= qq[  </convo>\n];
-
-        # Dump context with base64 encoding (already implemented)
         $xml .= qq[  <context>\n];
         for my $file (@context) {
             my $encoded = encode_base64(encode("UTF-8", $file));
@@ -347,7 +504,6 @@ our $cmd_lookup = {
 
         $xml .= qq[</dump>\n];
 
-        # Write to file
         try {
             open my $fh, '>', $filename
               or die "ERROR: Could not open '$filename' for writing: $!";
@@ -355,7 +511,19 @@ our $cmd_lookup = {
             close $fh;
             say "Dumped conversation to '$filename'.";
             if ($auto_dump_mode) {
+                ## We continue to set the active dump file to the
+                ## current save file, just in case the checks below fail
+                ## for some reason. However, we expect that this will be
+                ## immediately overwritten below.
                 $active_dump_file = $filename;
+
+                my $next_ts        = time;
+                my $next_name      = qq[dump-$session_id-$next_ts.xml];
+                my $maybe_dump_dir = qq[$synergy_root/etc/dumps];
+                $active_dump_file
+                  = (-e -d $maybe_dump_dir)
+                  ? qq[$maybe_dump_dir/$next_name]
+                  : $next_name;
             }
         }
         catch {
@@ -364,8 +532,6 @@ our $cmd_lookup = {
     },
     load => sub {
         my ($filename) = @_;
-
-        # Ensure a filename is provided
         unless (-e $filename) {
             say "ERROR: Please provide a valid filename for the load: $!";
             return;
@@ -383,7 +549,6 @@ our $cmd_lookup = {
 
         my $dom = Mojo::DOM->new($xml_content);
 
-        # Load session ID if available
         my $session_attr = $dom->at('dump')->attr('session');
         if ($session_attr) {
             $session_id = $session_attr;
@@ -471,15 +636,10 @@ our $cmd_lookup = {
 
         my $output;
 
-        if ($already_ran_command{$cmd} && $agent_mode) {
-          $output = qq[ERROR: already ran command '$cmd'];
-          goto THE_END;
-        }
-        $already_ran_command{$cmd}++;
-
-        my @cmd              = split / /, $cmd;
-        my $base_cmd         = shift @cmd;
-        my @allowed_commands = qw(grep sed wc ls file cat make head);
+        my @cmd      = split / /, $cmd;
+        my $base_cmd = shift @cmd;
+        my @allowed_commands
+          = qw(grep sed wc ls file find cat make head nl);
         unless (grep { $_ eq $base_cmd } @allowed_commands) {
             say "ERROR: Command '$base_cmd' not allowed in ,exec mode";
             say "Allowed commands: " . join(", ", @allowed_commands);
@@ -489,8 +649,10 @@ our $cmd_lookup = {
         # Validate no dangerous shell metacharacters in the raw command
         for my $c (@cmd) {
             if (DEBUG) {
+                say STDERR qq[];
                 say STDERR
                   qq[DEBUG: Looking at command '$c' for shell metacharacters];
+                say STDERR qq[];
             }
             if ($c =~ /[;&|`\$\(\)><\*]+/) {
                 say
@@ -499,101 +661,77 @@ our $cmd_lookup = {
             }
         }
 
-        # Create temporary file for output
         my $time = time;
         my $temp_file
           = "/tmp/synergy_exec_pid_$$" . "_timestamp_" . time() . ".txt";
 
-        # Execute command and capture output
         my $full_cmd = join(' ', $base_cmd, @cmd);
-        say "Executing: $full_cmd";
+        $output = "exec: $full_cmd";
+        say "exec: $full_cmd";
 
-        my $exit_code
-          = system(
-            qq[echo 'CMD:\n$base_cmd @cmd\nOUT:' > $temp_file && $base_cmd @cmd >> $temp_file 2>&1]
-          );
+        system(qq[echo 'COMMAND:\n$full_cmd\nOUTPUT:' > $temp_file]);
+        my $exit_code = system(qq[$base_cmd @cmd >> $temp_file 2>&1]);
 
         if ($exit_code == -1) {
             say "ERROR: Failed to execute command: $!";
-            unlink $temp_file if -e $temp_file;
-            return;
+            $output .= "\nWARNING: Command exited with status $exit_code";
+            goto THE_END;
         }
         elsif ($exit_code & 127) {
             printf "ERROR: Command died with signal %d, %s coredump\n",
               ($exit_code & 127), ($exit_code & 128) ? 'with' : 'without';
-            unlink $temp_file if -e $temp_file;
-            return;
+            $output .= "\nWARNING: Command exited with status $exit_code";
+            goto THE_END;
         }
         else {
             my $real_exit = $exit_code >> 8;
             if ($real_exit != 0) {
-              $output = "WARNING: Command exited with status $real_exit";
-              goto THE_END;
+                $output .= "\nWARNING: Command exited with status $real_exit";
+                goto THE_END;
             }
         }
 
-        # Check if output file exists and has content
         unless (-e $temp_file) {
-          $output =  "ERROR: Output file was not created";
-          goto THE_END;
+            $output .= "\nERROR: Output file was not created";
+            goto THE_END;
         }
 
         unless (-s $temp_file) {
-          $output = "INFO: Command executed successfully but produced no output";
-            unlink $temp_file;
-          goto THE_END;
+            $output
+              .= "\nINFO: Command executed successfully but produced no output";
+            goto THE_END;
         }
 
-        # Push the temporary file onto the context stack. Note
-        # that we don't unlink the temp file here since it's now
-        # in the context stack. The user can use ,pop or ,drop to
-        # remove it when done
+        # Push the temporary file onto the context stack.
 
         if (-f $temp_file) {
-            say "Command output saved to: $temp_file";
-            my $real_exit = $exit_code >> 8;
-            open my $fh, '>>', $temp_file;
-            say $fh qq[EXIT CODE: $real_exit];
-            close $fh;
-
+            say "exec: output saved to '$temp_file'";
             my $t;
             $t = slurp($temp_file);
 
             # regex to remove all non-ASCII characters
             my $placeholder = '?';
             $t =~ s/[^[:ascii:]]/$placeholder/g;
-
-            $output = <<"EOF";
-Executed: '$full_cmd'
-Result: $t
-EOF
-
-          THE_END:
-            unless ($agent_mode) {
-              push @context, qq[file: '$temp_file'\ncontents:\n$t];
-            }
-            push @convo, qq[$output];
+            $output .= qq[\n$t];
         }
+
+      THE_END:
+        push @convo, $output;
+        print qq[$output];
     },
     comment => sub {
         my ($comment) = @_;
         if ($comment) {
-          my $output = qq[You commented: $comment];
-          push @convo, $output;
-          say $output;
+            my $output = qq[comment: $comment];
+            push @convo, $output;
+            say $output;
         }
         return;
     },
     collect => sub {
 
-        # If there are no conversations to collect, do nothing
-      if ($agent_mode) {
-        return unless @agent_conversation;
-      } else {
         return unless @convo;
-      }
 
-        # Prepare the system prompt for summarization
         my $summary_prompt
           = qq[Please provide a concise, objective summary of the entire conversation.
     The summary should:
@@ -607,35 +745,27 @@ EOF
     ```
     Summary:];
 
-        my $summarizer = Langertha::Engine::OpenAI->new(
-            url           => q[http://localhost:8080/v1],
-            api_key       => q[sk-no-key-required],
-            model         => SUMMARY_MODEL,
-            system_prompt => "You are a professional summarizer.",
-        );
+        my $output;
 
-      my $output;
-
-        # Attempt to generate the summary
         try {
-            my @summary_prompt;
-            push @summary_prompt, $summary_prompt;
-            my $summary = $summarizer->simple_chat(@summary_prompt);
-
-            if ($agent_mode) {
-              @agent_conversation = (qq[AGENT ACTION SUMMARY:] . $summary);
-            }
-            else {
-              @convo = (qq[CONVERSATION SUMMARY:] . $summary);
-            }
-            $output = "Conversation has been collected and summarized.";
+            my $summary_prompt_safe = escape_raw_input($summary_prompt);
+            my $summary = call_assistant(
+                provider      => $current_provider,
+                api_key       => $api_key,
+                model         => $current_model_config->{model_name},
+                system_prompt => "You are a professional summarizer.",
+                user_message  => $summary_prompt_safe,
+            );
+            @convo = (qq[CONVERSATION SUMMARY:] . $summary);
+            $output
+              = "collect: Conversation has been collected and summarized.";
         }
         catch {
             my $error = $_;
             $output = "ERROR: Running ,collect failed with message: $error";
         };
-      push @convo, $output;
-      say $output;
+        push @convo, $output;
+        say $output;
     },
     apply_patch => sub {
         my ($raw_args) = @_;
@@ -643,14 +773,18 @@ EOF
         my $filename   = shift @args;
         my $diff_text  = join ' ', @args;
 
-        $diff_text =~ s/<<<<<<< SEARCH/\n<<<<<<< SEARCH\n/g;
+        $diff_text =~ s/<<<<<<< ORIGINAL/\n<<<<<<< ORIGINAL\n/g;
         $diff_text =~ s/=======/\n=======\n/g;
-        $diff_text =~ s/>>>>>>> REPLACE/\n>>>>>>> REPLACE\n/g;
+        $diff_text =~ s/>>>>>>> UPDATED/\n>>>>>>> UPDATED\n/g;
+
+        $diff_text =~ s/<NL>/\n/g;
 
         if (DEBUG) {
+            say STDERR qq[];
             say STDERR qq[DEBUG: apply_patch: args: ];
             say STDERR Dumper {filename => $filename,
                 diff_text => $diff_text,};
+            say STDERR qq[];
         }
 
         unless ($filename) {
@@ -695,7 +829,6 @@ EOF
 
         my $original_text = '';
 
-        # Read existing file content if it exists
         if (-f $filename) {
             try {
                 $original_text = slurp($filename);
@@ -706,15 +839,16 @@ EOF
             };
         }
 
-        # Apply edits from a diff-fenced format to the original text
         # Extract edit blocks from the diff-fenced format
         my @edit_blocks;
         while (
-            $diff_text =~ /[<]+ SEARCH\n(.*?)\n[=]+\n(.*?)\n[>]+ REPLACE/sg)
+            $diff_text =~ /[<]+ ORIGINAL\n(.*?)\n[=]+\n(.*?)\n[>]+ UPDATED/sg)
         {
             if (DEBUG) {
-                say STDERR qq[DEBUG: MATCH_SEARCH:  '$1'];
-                say STDERR qq[DEBUG: MATCH_REPLACE: '$2'];
+                say STDERR qq[];
+                say STDERR qq[DEBUG: MATCH_ORIGINAL:  '$1'];
+                say STDERR qq[DEBUG: MATCH_UPDATED: '$2'];
+                say STDERR qq[];
             }
             push @edit_blocks, $1;
             push @edit_blocks, $2;
@@ -726,9 +860,10 @@ EOF
         }
 
         # Apply each edit block
-        my $result = $original_text;
+        my $result      = $original_text;
+        my $any_changes = 0;
 
-        # Process blocks in groups of 3 (filename, search_text, replace_text)
+        # Process blocks in pairs (search_text, replace_text)
         for (my $i = 0; $i < @edit_blocks; $i += 2) {
 
             my ($search_text, $replace_text) = @edit_blocks[$i .. $i + 1];
@@ -737,38 +872,70 @@ EOF
             $search_text  =~ s/^\s+|\s+$//g;
             $replace_text =~ s/^\s+|\s+$//g;
 
-            $result =~ s/\Q$search_text\E/$replace_text/;
+            if (DEBUG) {
+                say STDERR qq[];
+                say STDERR qq[apply_patch: ],
+                  Dumper {
+                    search_text  => $search_text,
+                    replace_text => $replace_text
+                  };
+                say STDERR qq[];
+            }
 
-            # If search text not found and it's empty, append the replace text
-            if ($search_text eq '' or $search_text =~ / +/) {
+            # Handle empty search text (append operation) Changed from `/
+            # +/` to `/^\s*$/` The original regex `/ +/` matched ANY
+            # string containing spaces, causing text with spaces (like "
+            # old_line;" or "foo bar") to be appended instead of replaced
+            # (SA: SYN-038). The correct check is for strings that are
+            # ONLY whitespace.
+            if ($search_text eq '' or $search_text =~ /^\s*$/) {
                 $result .= $replace_text;
+                $any_changes = 1;
             }
+
+            # Normal replacement operation
+            elsif ($result =~ /\Q$search_text\E/) {
+                $result =~ s/\Q$search_text\E/$replace_text/;
+                $any_changes = 1;
+            }
+
+            # Search text not found
             else {
-                say "WARNING: Search text not found: "
-                  . substr($search_text, 0, 50) . "...";
+                say "WARNING: Search text not found: '"
+                  . substr($search_text, 0, 50) . "' ...";
             }
         }
 
-        # Write the result back to the file
-        try {
-            open my $fh, '>', $filename
-              or die "Cannot open '$filename' for writing: $!";
-            print $fh $result;
-            close $fh;
-            my $output = qq[Applied patch to file '$filename':\n];
-            $output .= qq[$diff_text\n];
-            push @convo, $output;
-            say $output;
+        # Only write the file if we made changes
+        if ($any_changes) {
+            try {
+                open my $fh, '>', $filename
+                  or die "Cannot open '$filename' for writing: $!";
+                print $fh $result;
+                close $fh;
+                my $output
+                  = qq[apply_patch: Applied edits to file '$filename':\n];
+                if ($agent_mode) {
+                    $output .= qq[$diff_text\n];
+                    push @convo, $output;
+                }
+                if ($agent_mode) {
+                    $output = substr($output, 0, 50) . "...";
+                }
+                say $output;
+            }
+            catch {
+                say "ERROR: Could not write to file '$filename': $_";
+                return;
+            };
         }
-        catch {
-            say "ERROR: Could not write to file '$filename': $_";
-            return;
-        };
+        else {
+            say
+              "INFO: No changes were applied to '$filename' (all search texts not found)";
+        }
     },
     agent => sub {
         my ($task_description) = @_;
-
-        # Validate task description
         unless ($task_description) {
             say "ERROR: No task provided to ,agent";
             say "Usage: ,agent <task description>";
@@ -781,104 +948,84 @@ EOF
             return;
         }
 
-        # Initialize agent mode
         $agent_mode = 1;
         say "AGENT MODE: Starting task: $task_description";
         say "Press Ctrl-C to interrupt at any time.\n";
 
-        # Agent execution loop
         while ($agent_mode) {
-            state $count         = 0;
+            state $count = 0;
 
-            # Build the agent's view of what has happened so far
+            my $ctx = build_prompt_context(
+                ai_comm_is_base64 => $ai_comm_is_base64,
+                convo             => \@convo,
+                context           => \@context,
+                sep               => $CONV_SEP,
+            );
 
-            my $encoded_agent_conversation = '';
-            if (@agent_conversation) {
-                $encoded_agent_conversation = encode_base64(
-                    encode("UTF-8", join($CONV_SEP, @agent_conversation)));
-            }
+            my $convo_desc      = $ctx->{convo_desc};
+            my $context_desc    = $ctx->{context_desc};
+            my $block_start     = $ctx->{block_start};
+            my $convo_content   = $ctx->{convo_content};
+            my $context_content = $ctx->{context_content};
+            my $block_end       = $ctx->{block_end};
 
-            # Build the full prompt with conversation history
-            # Create base64 encoded versions of conversation and context
-            my $encoded_convo = '';
-            if (@convo) {
-                $encoded_convo
-                  = encode_base64(encode("UTF-8", join($CONV_SEP, @convo)));
-            }
+            # Construct the full agent-specific system prompt
+            # dynamically on each turn.  This combines the base
+            # prompt, the REPL's existing conversation/context, and
+            # agent-specific guidelines.
 
-            my $encoded_context = '';
-            if (@context) {
-                $encoded_context
-                  = encode_base64(encode("UTF-8", join($CONV_SEP, @context)));
-            }
+            my $dynamic_agent_system_prompt_content
+              = $base_system_prompt . <<"EOAGENTPROMPT";
+Here is the history of the conversation to this point $convo_desc:
+$block_start
+$convo_content
+$block_end
 
-            # Complete the system prompt with encoded data
-            # Build the agent-specific prompt
-            my $agent_prompt = <<"AGENT_PROMPT";
-You are operating SYNERGY in agent mode. Your task is: <<< $task_description >>>
+Here are the contents of the files under discussion $context_desc:
+$block_start
+$context_content
+$block_end
 
-**OPERATIONAL RULES:**
-1.  You MUST generate EXACTLY ONE command per response
-2.  You MUST output each command on its own line
-3.  You MAY use any of the defined commands to explore local files that you need to complete your task
-4.  You MUST use `,comment` to explain your actions and decisions
-5.  You MUST wait for commands to complete before your next response.
-6.  You MUST use `,apply_patch` for all file modifications.
-7.  You MUST NOT use shell pipes, wildcards, or redirection with `,exec`.
-8. If a command fails, you SHOULD try an alternative approach.
-9. When task is complete, you MUST respond with: AGENT_COMPLETE: <brief summary>
+We are collaborating on a task where you are operating autonomously in agent mode. Our task is: <<< $task_description >>>
+
+**OPERATIONAL GUIDELINES for SYNERGY Agent Mode:**
+The following guidelines (expressed as "DOs and DON'Ts") are crucial for effective operation and collaboration. Please follow them as closely as possible.
+
+- DO read the AGENTS.md file in the currrent project, if one exists
+- DO use the defined commands to explore local files that you need to complete your task
+- DO output each command on its own line. This is especially important for ,apply_patch!
+- DO use only single shell commands with `,exec`. Avoid shell pipes, wildcards, or redirection.
+- DO review the outputs of the previously run commands, they're in the conversation history.
+- DO explain your actions and decisions using the `,comment` command
+- DO use the `,apply_patch` command to write and edit files, using smallest possible patches
+- DO respond when the task is complete with: ',comment AGENT_COMPLETE: <brief summary>'. The summary should concisely state the problem solved, the key changes made, and any outstanding issues or follow-up recommendations. If it's more than one line, prepend each line with `,comment ...`.
 
 ---
 **AVAILABLE COMMANDS:**
-- ,s					Print contents of file context stack
-- ,push file.txt		Push file.txt onto file context stack (B C - A B C)
-- ,pop				Pop top entry off of file context stack (A B - B)
-- ,swap				Swap top two elements of file context stack (A B - B A)
-- ,rot				Rotate file context stack entries (A B C - B C A)
-- ,drop [N...]		Remove elements of file context stack:
-                     - With no args: same as ,pop
-                     - With arg N: remove element at index N
-- ,peek N				View contents of Nth element of file context stack
-- ,exec <cmd> (run shell cmd: grep, sed, wc, ls, file, cat, make, head), e.g.,
-                     - ,exec ls
-                     - ,exec cat <file.txt>
-- ,apply_patch file.txt '<<<<<<< SEARCH
+- ,exec <cmd>       (Run shell cmd: grep sed wc ls file find cat make head), e.g.,
+                        - ,exec ls
+                        - ,exec cat <file.txt>
+                        - ,exec grep -n <pattern> <file.txt>
+- ,apply_patch file.txt '<<<<<<< ORIGINAL
                          foo
                          =======
                          bar
-                         >>>>>>> REPLACE'
-    - Apply patch in diff-fenced edit format to file.txt
-- ,comment <text> (explain reasoning)
-- ,collect (summarize main conversation history)
-- ,pwd (current directory)
-- ,cd <dir> (change directory)
+                         >>>>>>> UPDATED'
+                        - Apply patch in "Aider diff edit" format to file.txt
+- ,comment <text>   (explain reasoning)
 
 ---
 **CURRENT ENVIRONMENT:**
 Working Directory: $cwd
-Context Stack: @{[scalar @context]} items (summarized for efficiency)
-
----
-**INTERNAL LOG (Commands Executed by Agent):** (base64 encoded; primary source for your self-reflection)
-{{{
-$encoded_agent_conversation
-}}}
-AGENT_PROMPT
-
-            # Create agent-specific Langertha instance
-            my $agent_synergy = Langertha::Engine::OpenAI->new(
-                url           => q[http://localhost:8080/v1],
-                api_key       => q[sk-no-key-required],
-                model         => CHAT_MODEL,
-                system_prompt => $agent_prompt,
-            );
+EOAGENTPROMPT
 
             if (DEBUG) {
+                say qq[];
                 say qq[DEBUG: AGENT PROMPT];
-                say qq[$agent_prompt];
+                say qq[$dynamic_agent_system_prompt_content];
+                say STDERR qq[];
             }
 
-            # Get the agent's next command with retry logic
             my $retry_count = 0;
             my $success     = 0;
             my $command;
@@ -893,11 +1040,19 @@ AGENT_PROMPT
                         sleep $delay;
                     }
 
-                    $command = $agent_synergy->simple_chat("Your next command:");
+                    my $agent_next_turn_prompt = <<"EOTURN";
+SYNERGY, what is the next command we should execute? Please consider our overall task and current progress, and feel free to use `,comment` to explain your reasoning or immediate objective.
+EOTURN
+                    $command = call_assistant(
+                        provider      => $current_provider,
+                        api_key       => $api_key,
+                        model         => $current_model_config->{model_name},
+                        system_prompt => $dynamic_agent_system_prompt_content,
+                        user_message  => qq[$agent_next_turn_prompt],
+                    );
                     $command =~ s/<\｜end▁of▁sentence\｜>//;
                     $success = 1;
                     $api_calls++;
-                    $tokens += int length $command;
                 }
                 catch {
                     my $error = $_;
@@ -918,39 +1073,28 @@ AGENT_PROMPT
             }
 
             if ($command) {
-
-                # Display what agent is "typing"
-                print_agent_typing("$agent_shell_prompt > $command");
-
-                # Execute the command through existing REPL infrastructure
                 execute_agent_command($command);
 
                 # After executing the command, capture the command
                 # output and make it visible to the agent.
                 my $last_convo_entry;
                 if (@convo) {
-                  $last_convo_entry = $convo[-1];
+                    $last_convo_entry = $convo[-1];
                 }
-                my $command_summary = "You executed: $command";
+                my $command_summary = "agent: executed '$command'";
 
                 if ($last_convo_entry) {
-                  $command_summary .= "\nResult: $last_convo_entry";
+                    $command_summary
+                      .= "\nagent: result = '$last_convo_entry'";
                 }
 
-                push @agent_conversation, $command_summary;
-
-                if (VERBOSE) {
-                  say qq[];
-                  say qq[AGENT CONVERSATION:];
-                  say Dumper {agent_conversation => \@agent_conversation};
-                  say qq[];
-                }
+                push @convo, $command_summary;
 
                 # Check for stop condition
                 if ($command =~ /AGENT_COMPLETE:(.*)/s) {
                     my $summary = $1;
                     $summary =~ s/^\s+|\s+$//g;
-                    say "\nAGENT MODE: Task completed.";
+                    say "\nagent: Task complete.";
                     say "Summary: $summary" if $summary;
                     $agent_mode = undef;
                     last;
@@ -961,7 +1105,7 @@ AGENT_PROMPT
             }
 
             # Brief pause for UX (unless in fast mode)
-            sleep 0.5 unless $ENV{SYNERGY_AGENT_FAST};
+            sleep 1 unless $ENV{SYNERGY_AGENT_FAST};
 
             # Check if user wants to interrupt
             if ($sigint_recvd) {
@@ -980,11 +1124,125 @@ AGENT_PROMPT
                 }
             }
         }
-
-        # Return control to user
         print $user_shell_prompt;
     },
+    inspect => sub {
+        if (-p STDIN) {
+            say "ERROR: ,inspect is only available in interactive mode";
+            return;
+        }
+
+        # Trap process exit to prevent accidental shutdown
+        local *CORE::GLOBAL::exit = sub { die "__SYNERGY_INSPECT_EXIT__\n" };
+
+        # Configure Dumper for readable, clean output
+        local $Data::Dumper::Terse    = 1;
+        local $Data::Dumper::Indent   = 1;
+        local $Data::Dumper::Sortkeys = 1;
+        local $Data::Dumper::Pad      = '  ';
+
+        say
+          "[Entering SYNERGY Inspector - type ',q' to return, ',?' for help]";
+
+        my $inspector_helptext = <<"EOF";
+This is the Synergy Inspector. Type the name of a variable from the
+program to see its value.
+
+Commands:
+,q			quit
+,?			print help text
+EOF
+
+      LINE: while (1) {
+            print "INSPECT > ";
+            my $line = <STDIN>;
+            last unless defined $line;
+            $line =~ s/^\s+|\s+$//g;
+
+            next if $line eq '';
+            last if $line =~ /^(,q)$/i;
+
+            if ($line =~ /^(,\?)$/) { say $inspector_helptext; next LINE; }
+
+            try {
+                # Evaluate in list context to capture arrays/hashes fully
+                # We use 'do' to allow for complex expressions
+                my @res
+                  = eval "package main; no strict; no warnings; do { $line }";
+
+                if ($@) {
+
+                    # If they tried to call exit(), don't crash, just complain
+                    if ($@ =~ /__SYNERGY_INSPECT_EXIT__/) {
+                        say "  [Blocked attempt to exit process]";
+                    }
+                    else {
+                        chomp(my $err = $@);
+                        say "  ERROR: $err";
+                    }
+                }
+                else {
+                    # Dump the results. If list context has multiple items,
+                    # Dumper will represent them as $VAR1, $VAR2, etc.
+                    print Data::Dumper::Dumper(\@res);
+                }
+            }
+            catch {
+                chomp(my $err = $_);
+                say "  CRITICAL ERROR: $err";
+            };
+        }
+
+        say "Returned to SYNERGY REPL";
+        return;
+    },
 };
+
+sub build_prompt_context {
+    my (%args)            = @_;
+    my $ai_comm_is_base64 = $args{ai_comm_is_base64};
+    my $convo_aref        = $args{convo}   // [];
+    my $context_aref      = $args{context} // [];
+    my $sep               = $args{sep}     // "\n===\n";
+
+    my ($convo_content, $context_content);
+    my ($convo_desc,    $context_desc);
+    my ($block_start,   $block_end);
+
+    if ($ai_comm_is_base64) {
+        $convo_desc   = '(base64 encoded)';
+        $context_desc = '(base64 encoded)';
+        $block_start  = '{{{';
+        $block_end    = '}}}';
+
+        $convo_content
+          = @$convo_aref
+          ? encode_base64(encode("UTF-8", join($sep, @$convo_aref)))
+          : '';
+        $context_content
+          = @$context_aref
+          ? encode_base64(encode("UTF-8", join($sep, @$context_aref)))
+          : '';
+    }
+    else {
+        $convo_desc   = '(plain text)';
+        $context_desc = '(plain text)';
+        $block_start  = '```';
+        $block_end    = '```';
+
+        $convo_content   = @$convo_aref   ? join($sep, @$convo_aref)   : '';
+        $context_content = @$context_aref ? join($sep, @$context_aref) : '';
+    }
+
+    return {
+        convo_content   => $convo_content,
+        context_content => $context_content,
+        convo_desc      => $convo_desc,
+        context_desc    => $context_desc,
+        block_start     => $block_start,
+        block_end       => $block_end,
+    };
+}
 
 # Do not enable autodump mode if SYNERGY is being controlled from
 # STDIN. This is necessary for the following reasons:
@@ -1001,7 +1259,53 @@ AGENT_PROMPT
 # understanding, which may change.
 $auto_dump_mode++ unless -p STDIN;
 
+# This override should only be used by our e2e test suite that
+# drives SYNERGY as a subprocess.
+$auto_dump_mode++ if $ENV{SYNERGY_FORCE_AUTODUMP};
+
 unless (-p STDIN) {
+
+    # https://patorjk.com/software/taag/
+    # Font: Standard
+    print <<"EOBANNER";
+
+  ░██████   ░██     ░██ ░███    ░██ ░██████████ ░█████████    ░██████  ░██     ░██ 
+ ░██   ░██   ░██   ░██  ░████   ░██ ░██         ░██     ░██  ░██   ░██  ░██   ░██  
+░██           ░██ ░██   ░██░██  ░██ ░██         ░██     ░██ ░██          ░██ ░██   
+ ░████████     ░████    ░██ ░██ ░██ ░█████████  ░█████████  ░██  █████    ░████    
+        ░██     ░██     ░██  ░██░██ ░██         ░██   ░██   ░██     ██     ░██     
+ ░██   ░██      ░██     ░██   ░████ ░██         ░██    ░██   ░██  ░███     ░██     
+  ░██████       ░██     ░██    ░███ ░██████████ ░██     ░██   ░█████░█     ░██     
+
+@@@@@@@@@##*#****#***#############%#########*#%######%##%#*######%%%%%
+@@@@@@%%%###**#****###########%###########%%##%%########%#*###########
+%%##%%%%%%#****#**#########%##########################################
+@@@@@@%%#%*******########%#######*+==----=+****#***********###########
+@@@@@%%*##********#####%###*=-------=+*+=--=****#*************########
+@@%%##**##********#####+=--------=+*+--=====+****##***********########
+##%%%%*#*#*********#*=====++--------=+*****##****##*###******#########
+@@%####**************=----==-==-----=*****++=+****##*********#########
+@%##**#++***********#+-+****+===----=====----=+******##****###########
+%@@@%#%#++*#**************+**=-=--------------=+*******###############
+@@@@@@@*#%*#***********--------==--------------=*********#**##########
+@%%%%%@#%##%#**********=-------==--------------=+*****################
+@%%%%@@%%%#************+-------==--===---------=+*****################
+%%%%%@@@%####***********=-------===------------=+*****#*##############
+@%%%%@%##%##************+-----------=+****#*=--=+*******##############
+@#%%@@@%#*******#********+------=*###*=-=*#=---=+********#############
+%%%@@@@@@@%%%%%***********+----=*+----+##%+---==**********############
+%%%@@@@@@@@@%***************=----+#%%####=----=+**********############
+@#@@@@@@@@%#**************#***=----=++=-------=+*#*********##########%
+#%@@@@@@@%****************#*****=------------==++++********###########
+#%@@%%%%%********#*******#********=--------==+========+*****##########
+%%#%%%@@#*******##*******#**********+=---===============*****#########
+@@@@%%%%********##*******#*************+=================+*****#######
+%%%@@@@%*********#*******#******#******+==================+******#####
+@@@@@@@@%******%####*****#******###*****===================****###****
+@@@@@@@@@%******###*******#*****###*##**+==================*##******#*
+@@@@@@@@%#####*####*********####*#######*=============+*************++
+@@@@@@%%%***********************########*======++*****************++++
+EOBANNER
     print "Session ID: $session_id\n";
     print "Log file: $logfile\n";
 }
@@ -1016,7 +1320,26 @@ LINE: while (<>) {
     # subroutine in another hash element, because technically the
     # latter does not exist yet until post-init.
     $cmd_lookup->{exit} = sub {
-        if ($active_dump_file) { $cmd_lookup->{dump}->($active_dump_file); }
+        if ($auto_dump_mode) {
+            ## If autodump is enabled, ensure we have a target file and dump on exit.
+            ## If the user never ran ,dump (or anything else that sets
+            ## $active_dump_file), pick a fresh autodump filename now.
+            if (!$active_dump_file) {
+                my $next_uuid = generate_uuid();
+                my $next_ts   = time;
+                my $next_name = qq[$next_uuid.$next_ts.xml];
+
+                my $maybe_dump_dir = qq[$synergy_root/etc/dumps];
+                $active_dump_file
+                  = (-e -d $maybe_dump_dir)
+                  ? qq[$maybe_dump_dir/$next_name]
+                  : $next_name;
+            }
+
+            $cmd_lookup->{dump}->($active_dump_file);
+        }
+
+        print "Goodbye!\n";
         exit 0;
     };
 
@@ -1045,98 +1368,48 @@ LINE: while (<>) {
     my $input_line = $_;
     chomp(my $question = $input_line);
 
-    chomp(my @input = $input_line);
-
-    # when the user hits enter, i shouldn't crash
-    if (scalar @input == 1) {
-        next if $input[0] eq '';
+    # Print a warning and return to the REPL prompt without making an
+    # API call if the question is empty or entirely whitespace.
+    if ($question =~ /^\s*$/) {
+        say "WARNING: Ignoring empty assistant query";
+        unless (-p STDIN) {
+            print $user_shell_prompt;
+        }
+        next LINE;
     }
 
-    $base_system_prompt = <<"EOPROMPT";
-# AI Persona: SYNERGY AI Assistant (v5)
+    my $ctx = build_prompt_context(
+        ai_comm_is_base64 => $ai_comm_is_base64,
+        convo             => \@convo,
+        context           => \@context,
+        sep               => $CONV_SEP,
+    );
 
-## Core Identity
-You are SYNERGY, a technical peer specializing in **computer programming, distributed systems, mathematical problem solving, and technical writing**.
+    my $convo_desc      = $ctx->{convo_desc};
+    my $context_desc    = $ctx->{context_desc};
+    my $block_start     = $ctx->{block_start};
+    my $convo_content   = $ctx->{convo_content};
+    my $context_content = $ctx->{context_content};
+    my $block_end       = $ctx->{block_end};
 
-## User Context
-Your USER is an experienced programmer and technical writer, working at a distributed SQL database company. They value **precision, simplicity, and maintainability** in technical solutions.
 
-## Operational Principles
-
-### Technical Work
-- **Assume deep expertise:** Discuss advanced CS concepts (distributed systems, algorithms, database internals) at peer level without excessive explanation
-- **Favor simplicity:** Choose maintainable solutions over complex ones unless complexity provides clear benefits
-- **Include comprehensive tests:** For non-trivial code, provide test suites covering logic, edge cases, and failure modes
-- **Focus on practical concerns:** Address performance, fault tolerance, observability, and operational complexity
-
-### Communication Style
-- **Adapt to context:** Match response style to the question type - exploratory for brainstorming, precise for implementation, analytical for debugging
-- **Default to Markdown** for structured content, plain text for simple answers
-- **Be direct and actionable:** Eliminate unnecessary verbosity while maintaining clarity
-- **State confidence levels** when dealing with complex or uncertain problems
-- **Ask clarifying questions** when requirements are ambiguous rather than making assumptions
-- **Provide progressive disclosure:** Start with core solution, offer to elaborate on specific aspects
-
-### Problem-Solving Approach
-1. **Understand the immediate need** - Clarify the specific problem before expanding scope
-2. **Decompose systematically** - Break complex problems into manageable, actionable parts
-3. **Consider multiple perspectives** - Algorithmic, operational, security, maintainability
-4. **Evaluate trade-offs explicitly** - Especially for distributed systems and architecture decisions
-5. **Support iteration** - Provide solutions that can be incrementally refined
-6. **Offer next steps** - Suggest logical follow-up questions or improvements
-
-## REPL Interaction Patterns
-- **For debugging:** Ask for error messages, logs, and reproduction steps before suggesting solutions
-- **For code review:** Focus on specific concerns (performance, correctness, maintainability) unless broader review requested
-- **For architecture questions:** Start with constraints and requirements, then explore options
-- **For "quick questions":** Provide direct answers first, then context if needed
-- **For exploratory work:** Offer multiple approaches with brief trade-off analysis
-
-## Creative & Mathematical Work
-- **For writing:** Engage with craft and technique alongside technical precision
-- **For mathematics:** Balance rigorous proof with intuitive understanding and elegant presentation
-- **Encourage exploration** while maintaining intellectual rigor
-
-## Key Constraints
-- Generate **evergreen documentation** (avoid temporal references)
-- Provide **complete, runnable examples** with clear build/run instructions
-- **Scope responses appropriately** - Match depth to question complexity
-- **Acknowledge limitations** - State when problems require domain expertise or additional context
-- **Prefer working code over pseudocode** unless specifically requested otherwise
-
-Execute as SYNERGY: A flexible technical peer optimized for programming, mathematics, and writing collaboration.
-EOPROMPT
-
-    # Create base64 encoded versions of conversation and context
-    my $encoded_convo = '';
-    if (@convo) {
-        $encoded_convo = encode_base64(encode("UTF-8", join($CONV_SEP, @convo)));
-    }
-
-    my $encoded_context = '';
-    if (@context) {
-        $encoded_context
-          = encode_base64(encode("UTF-8", join($CONV_SEP, @context)));
-    }
-
-    # Complete the system prompt with encoded data
     $system_prompt = $base_system_prompt . <<"EOCONTEXT";
-Here is the history of the conversation to this point (base64 encoded):
-{{{
-$encoded_convo
-}}}
+Here is the history of the conversation to this point $convo_desc:
+$block_start
+$convo_content
+$block_end
 
-Here are the contents of the files under discussion (base64 encoded):
-{{{
-$encoded_context
-}}}
+Here are the contents of the files under discussion $context_desc:
+$block_start
+$context_content
+$block_end
 EOCONTEXT
 
-    # when the user enters 'command mode', i should not send any input
-    # to the assistant. instead, i should only process user
-    # commands. however, there should be no access to command mode
-    # when i get input from STDIN, since those are essentially
-    # "one-shot" requests
+    # When the user enters 'command mode', I should not send any input
+    # to the assistant. Instead, I should only process user
+    # commands. However, there should be no access to command mode
+    # when I get input from STDIN, since those inputs are essentially
+    # "one-shot" requests.
 
     do {
         my $command_mode;
@@ -1160,11 +1433,13 @@ EOCONTEXT
             my $maybe_arg     = $3;
 
             if (DEBUG) {
+                say STDERR qq[];
                 say STDERR qq[DEBUG: Command mode args: ];
                 say STDERR Dumper {
                     maybe_command => $maybe_command,
                     maybe_arg     => $maybe_arg
                 };
+                say STDERR qq[];
             }
 
             if (   $maybe_command
@@ -1174,13 +1449,10 @@ EOCONTEXT
                 $command_mode++;
                 $maybe_arg =~ s/^ +//;
                 $cmd_lookup->{$maybe_command}->($maybe_arg);
-                push @convo,
-                  qq[USER (REPL COMMAND) > ,$maybe_command $maybe_arg];
             }
             elsif ($maybe_command && exists $cmd_lookup->{$maybe_command}) {
                 $command_mode++;
                 $cmd_lookup->{$maybe_command}->();
-                push @convo, qq[USER (REPL COMMAND) > ,$maybe_command];
             }
             else {
                 $command_mode++;
@@ -1200,17 +1472,8 @@ EOCONTEXT
         }
     };
 
-    my $synergy = Langertha::Engine::OpenAI->new(
-        url           => q[http://localhost:8080/v1],
-        api_key       => q[sk-no-key-required],
-        model         => CHAT_MODEL,
-        system_prompt => $system_prompt,
-    );
-
     my $start = time;
-    if (VERBOSE) {
-        say qq[$synergy_shell_prompt thinking ...] unless -p STDIN;
-    }
+    say qq[$synergy_shell_prompt thinking ...] unless -p STDIN;
 
     my $answer;
     my $retry_count = 0;
@@ -1227,7 +1490,14 @@ EOCONTEXT
                 sleep $delay;
             }
 
-            $answer  = $synergy->simple_chat(@input);
+            my $input_line_safe = escape_raw_input($input_line);
+            $answer = call_assistant(
+                provider      => $current_provider,
+                api_key       => $api_key,
+                model         => $current_model_config->{model_name},
+                system_prompt => $system_prompt,
+                user_message  => $input_line_safe,
+            );
             $answer =~ s/<\｜end▁of▁sentence\｜>//;
             $success = 1;
         }
@@ -1262,10 +1532,326 @@ EOCONTEXT
     push @convo, qq[$synergy_shell_prompt $answer];
 
     unless (-p STDIN) {
-        printf("\n -- %.3f seconds (%s)\n", ($end - $start), $synergy->model);
+        printf(
+            "\n -- %.3f seconds (%s)\n",
+            ($end - $start),
+            $current_model_config->{model_name}
+        );
         print $just_ran_command ? $user_shell_prompt : $synergy_shell_prompt;
         $just_ran_command = undef;
     }
+}
+
+# If the REPL loop terminated due to EOF (Ctrl-D) in interactive mode,
+# (and if there's an active dump file), save the conversation.
+if ($auto_dump_mode && $active_dump_file) {
+
+    # Print to STDERR to avoid polluting STDOUT, which might be piped
+    print STDERR
+      "INFO: Ctrl-D detected. Auto-saving conversation to '$active_dump_file'...\n";
+    $cmd_lookup->{dump}->($active_dump_file);
+}
+
+sub generate_uuid {
+    return $uuid_generator ? $uuid_generator->create_str() : simple_uuid();
+}
+
+sub simple_uuid {
+    return join(
+        '-',
+        sprintf( "%08x", int( rand(0xffffffff) ) ),
+        sprintf( "%04x", int( rand(0xffff) ) ),
+        sprintf( "%04x", int( rand(0xffff) ) ),
+        sprintf( "%04x", int( rand(0xffff) ) ),
+        sprintf(
+            "%04x%08x",
+            int( rand(0xffff) ),
+            int( rand(0xffffffff) )
+        ),
+    );
+}
+
+sub call_assistant {
+    my (%args) = @_;
+    my $provider      = $args{provider};
+    my $api_key       = $args{api_key};
+    my $model         = $args{model};
+    my $system_prompt = $args{system_prompt} // '';
+    my $user_message  = $args{user_message}  // '';
+
+    if ($ENV{SYNERGY_OFFLINE}) {
+        return offline_response();
+    }
+
+    my $provider_def = provider_def($provider);
+
+    if ($ENV{SYNERGY_CURL_STUB}) {
+        my $stub_body = slurp($ENV{SYNERGY_CURL_STUB});
+        return $provider_def->{parse}->($stub_body);
+    }
+
+    if (!$api_key) {
+        die qq[Missing API key for provider '$provider'];
+    }
+
+    my $request = $provider_def->{build}->(
+        api_key       => $api_key,
+        model         => $model,
+        system_prompt => $system_prompt,
+        user_message  => $user_message,
+    );
+
+    my $json_body = $JSON->encode($request->{body});
+    my $result    = curl_request(
+        url     => $request->{url},
+        headers => $request->{headers},
+        body    => $json_body,
+    );
+
+    my $status = $result->{status_code};
+    if ($status < 200 || $status >= 300) {
+        my $preview = $result->{body} // '';
+        $preview =~ s/\s+/ /g;
+        $preview = substr($preview, 0, 400);
+        die qq[HTTP $status: $preview];
+    }
+
+    return $provider_def->{parse}->($result->{body});
+}
+
+sub offline_response {
+    return $ENV{SYNERGY_OFFLINE_RESPONSE} // '[SYNERGY_OFFLINE]';
+}
+
+sub provider_def {
+    my ($provider) = @_;
+    my %defs = (
+        openai => {
+            build => \&build_openai_request,
+            parse => \&parse_openai_response,
+        },
+        anthropic => {
+            build => \&build_anthropic_request,
+            parse => \&parse_anthropic_response,
+        },
+        gemini => {
+            build => \&build_gemini_request,
+            parse => \&parse_gemini_response,
+        },
+    );
+
+    die qq[Unknown provider '$provider'] unless $defs{$provider};
+    return $defs{$provider};
+}
+
+sub build_openai_request {
+    my (%args) = @_;
+    my $api_key       = $args{api_key};
+    my $model         = $args{model};
+    my $system_prompt = $args{system_prompt} // '';
+    my $user_message  = $args{user_message}  // '';
+
+    my @messages;
+    if (length $system_prompt) {
+        push @messages, { role => 'system', content => $system_prompt };
+    }
+    push @messages, { role => 'user', content => $user_message };
+
+    my %body = (
+        model    => $model,
+        messages => \@messages,
+        stream   => JSON::PP::false,
+    );
+
+    return {
+        url     => 'https://api.openai.com/v1/chat/completions',
+        headers => [
+            'Content-Type: application/json',
+            'Authorization: Bearer ' . $api_key,
+        ],
+        body => \%body,
+    };
+}
+
+sub build_anthropic_request {
+    my (%args) = @_;
+    my $api_key       = $args{api_key};
+    my $model         = $args{model};
+    my $system_prompt = $args{system_prompt} // '';
+    my $user_message  = $args{user_message}  // '';
+
+    my %body = (
+        model      => $model,
+        messages   => [ { role => 'user', content => $user_message } ],
+        max_tokens => 8192,
+    );
+    $body{system} = $system_prompt if length $system_prompt;
+
+    return {
+        url     => 'https://api.anthropic.com/v1/messages',
+        headers => [
+            'Content-Type: application/json',
+            'x-api-key: ' . $api_key,
+            'anthropic-version: 2023-06-01',
+        ],
+        body => \%body,
+    };
+}
+
+sub build_gemini_request {
+    my (%args) = @_;
+    my $api_key       = $args{api_key};
+    my $model         = $args{model};
+    my $system_prompt = $args{system_prompt} // '';
+    my $user_message  = $args{user_message}  // '';
+
+    my @contents;
+    if (length $system_prompt) {
+        push @contents, {
+            role  => 'user',
+            parts => [ { text => $system_prompt } ],
+        };
+    }
+    push @contents,
+      { role => 'user', parts => [ { text => $user_message } ] };
+
+    my %body = (
+        contents         => \@contents,
+        generationConfig => {
+            maxOutputTokens => 8192,
+        },
+    );
+
+    my $url
+      = 'https://generativelanguage.googleapis.com/v1beta/models/'
+      . $model
+      . ':generateContent?key='
+      . $api_key;
+
+    return {
+        url     => $url,
+        headers => ['Content-Type: application/json'],
+        body    => \%body,
+    };
+}
+
+sub parse_openai_response {
+    my ($body) = @_;
+    my $data = decode_json_response($body);
+    my $content = $data->{choices}[0]{message}{content};
+    die "OpenAI response missing content" unless defined $content;
+    return $content;
+}
+
+sub parse_anthropic_response {
+    my ($body) = @_;
+    my $data = decode_json_response($body);
+    my $content = $data->{content}[0]{text};
+    die "Anthropic response missing content" unless defined $content;
+    return $content;
+}
+
+sub parse_gemini_response {
+    my ($body) = @_;
+    my $data = decode_json_response($body);
+    my $content = $data->{candidates}[0]{content}{parts}[0]{text};
+    die "Gemini response missing content" unless defined $content;
+    return $content;
+}
+
+sub decode_json_response {
+    my ($body) = @_;
+    my $data;
+    try {
+        $data = $JSON->decode($body);
+    }
+    catch {
+        my $error = $_;
+        my $preview = $body // '';
+        $preview =~ s/\s+/ /g;
+        $preview = substr($preview, 0, 200);
+        die qq[Failed to parse JSON response: $error (body: $preview)];
+    };
+    return $data;
+}
+
+sub curl_request {
+    my (%args) = @_;
+    my $url     = $args{url};
+    my $headers = $args{headers} // [];
+    my $body    = $args{body}    // '';
+
+    my ( $req_fh,  $req_file )  = tempfile( 'synergy_req_XXXX',  TMPDIR => 1 );
+    my ( $resp_fh, $resp_file ) = tempfile( 'synergy_resp_XXXX', TMPDIR => 1 );
+    my ( $err_fh,  $err_file )  = tempfile( 'synergy_err_XXXX',  TMPDIR => 1 );
+
+    print $req_fh $body;
+    close $req_fh;
+    close $resp_fh;
+    close $err_fh;
+
+    my @cmd = (
+        'curl',
+        '--silent',
+        '--show-error',
+        '--write-out',
+        '%{http_code}',
+        '--output',
+        $resp_file,
+        '--request',
+        'POST',
+        '--data-binary',
+        "\@$req_file",
+        '--stderr',
+        $err_file,
+    );
+    for my $header (@$headers) {
+        push @cmd, '--header', $header;
+    }
+    push @cmd, $url;
+
+    open my $curl_fh, '-|', @cmd
+      or die "ERROR: failed to execute curl: $!";
+    my $http_code = do { local $/; <$curl_fh> };
+    close $curl_fh;
+    my $exit_code = $? >> 8;
+
+    my $stderr = slurp($err_file);
+    my $resp_body = slurp($resp_file);
+
+    unlink $req_file;
+    unlink $resp_file;
+    unlink $err_file;
+
+    if ($exit_code != 0) {
+        die qq[curl failed (exit $exit_code): $stderr];
+    }
+
+    $http_code //= '';
+    $http_code =~ s/\s+//g;
+    if ($http_code !~ /^\d+$/) {
+        die qq[curl failed to return HTTP status code];
+    }
+
+    return {
+        status_code => int($http_code),
+        body        => $resp_body,
+        stderr      => $stderr,
+    };
+}
+
+sub escape_raw_input {
+    my ($s) = @_;
+    $s =~ s/\\/\\\\/g;
+    $s =~ s/"/\\"/g;
+    $s =~ s/\n/\\n/g;
+    $s =~ s/\r/\\r/g;
+    $s =~ s/\t/\\t/g;
+    $s =~ s/\f/\\f/g;
+    $s =~ s/\b/\\b/g;
+    $s =~ s/</\\u003C/g;
+    $s =~ s/>/\\u003E/g;
+    return $s;
 }
 
 sub sigint_handler {
@@ -1278,42 +1864,6 @@ sub sigint_handler {
     else {
         $sigint_recvd = 1;
     }
-}
-
-sub command_help {
-    ## -> IO!
-    my $helptext = <<"EOF";
-This is Synergy. You are interacting with the command processor.
-A command is either a prose form for the Assistant to evaluate or one of the following:
-,help ,?			Print this help message
-,history			Print out the chat history so far
-,s					Print contents of file context stack
-,push file.txt		Push file.txt onto file context stack (B C - A B C)
-,pop				Pop top entry off of file context stack (A B - B)
-,swap				Swap top two elements of file context stack (A B - B A)
-,rot				Rotate file context stack entries (A B C - B C A)
-,drop [N...]		Remove elements of file context stack:
-                     - With no args: same as ,pop
-                     - With arg N: remove element at index N
-,peek N				View contents of Nth element of file context stack
-,reset [N]			Discard history chat history (A B C - )
-                    - With no args: discard entire history
-                    - With arg N: reset history to position N
-,collect			Replace current chat history with an Assistant-generated summary
-,prompt				Print the current prompt
-,model				Print the current model
-,tokens				Print the approximate token count in the current chat history
-,dump file.xml		Save session history (including current file context stack, if any) to disk
-,load file.xml		Load session history (including file context stack, if any) from disk
-,pwd				Print current working directory
-,cd /some/dir		Change working directory to /some/dir
-,exec cmd			Execute shell command (grep sed wc ls file cat make), save output to a file on the context stack
-,apply_patch file.txt '<<<<<<< SEARCH foo ======= bar >>>>>>> REPLACE'
-					Apply patch in diff-fenced edit format to file.txt
-,comment			Write a comment that is printed back to the REPL's output without calling the Assistant
-,exit				Quit the Synergy command processor
-EOF
-    print $helptext;
 }
 
 sub append_to_log {
@@ -1343,35 +1893,54 @@ sub file_eq {
     return ($stat1[0] == $stat2[0] && $stat1[1] == $stat2[1]);
 }
 
-
 sub execute_agent_command {
     my ($command) = @_;
 
-    if (VERBOSE) {
-        say qq[];
-
-        # say qq[execute_agent_command (1): '$command'];
-    }
-
     # Special handling to allow apply_patch to handle multi-line diff
     # fenced edits as input from the agent.
-    if ($command =~ /^,apply_patch\s+(\S+) '(.*)/s) {
-        my $filename      = $1;
-        my $patch_content = $2;
+    if ($command =~ /^,(apply_patch)\s+(\S+)\s+'(.*)$/s) {
+        my $cmd_name      = 'apply_patch';
+        my $filename      = $2;
+        my $patch_content = $3;
 
-        if (defined $patch_content) {
-            $cmd_lookup->{apply_patch}->($filename . ' ' . $patch_content);
-
-            if (VERBOSE) {
-                say qq[execute_agent_command (APPLY_PATCH): ],
-                  Dumper {filename => $filename, patch_content => $patch_content,};
-            }
-
-            if ($auto_dump_mode && $active_dump_file) {
-                $cmd_lookup->{dump}->($active_dump_file);
-            }
-            return;
+        # Check if we have the complete patch (ends with closing quote
+        # after UPDATED marker)
+        if ($patch_content =~ />>>>>>> UPDATED'\s*$/s) {
+            $cmd_lookup->{$cmd_name}->($filename . ' ' . $patch_content);
         }
+        else {
+            # We need to accumulate more lines - read from the string handle
+            my $bytes = encode('UTF-8', $command);
+            open my $sh, '<', \$bytes
+              or die qq[can not open string handle on '$command': $!];
+
+            my $accumulated_patch = $patch_content;
+            my $found_end         = 0;
+
+            while (<$sh>) {
+                $accumulated_patch .= $_;
+                if (/>>>>>>> UPDATED'\s*$/) {
+                    $found_end = 1;
+                    last;
+                }
+            }
+            close $sh;
+
+            if ($found_end) {
+                $cmd_lookup->{$cmd_name}
+                  ->($filename . ' ' . $accumulated_patch);
+            }
+            else {
+                say
+                  "AGENT ERROR: Incomplete apply_patch command - missing closing marker";
+                push @convo, qq[AGENT ERROR: Incomplete apply_patch command];
+            }
+        }
+
+        if ($auto_dump_mode && $active_dump_file) {
+            $cmd_lookup->{dump}->($active_dump_file);
+        }
+        return;
     }
 
     # Parse the command to determine if it's a REPL command or regular input
@@ -1381,11 +1950,6 @@ sub execute_agent_command {
     if ($command =~ /$command_pat/) {
         my $cmd_name = $1;
         my $cmd_args = $2 // '';
-
-        if (VERBOSE) {
-            say qq[execute_agent_command (SINGLE LINE PARSE): ],
-              Dumper {cmd_name => $cmd_name, cmd_args => $cmd_args};
-        }
 
         # Check if this is a valid REPL command
         if (exists $cmd_lookup->{$cmd_name}) {
@@ -1397,9 +1961,6 @@ sub execute_agent_command {
             else {
                 $cmd_lookup->{$cmd_name}->();
             }
-
-          # CRITICAL FIX: Ensure context stack updates are visible immediately
-          # by not returning here - let the auto-dump happen first
         }
         else {
             say "AGENT ERROR: Unknown command ',$cmd_name'";
@@ -1407,35 +1968,75 @@ sub execute_agent_command {
         }
     }
     else {
-     # If single-line parsing failed, try line-by-line parsing
-     # This handles multi-line responses that contain commands mixed with text
-        open my $sh, '<', \$command;
+        # If single-line parsing failed, try line-by-line parsing.  This
+        # handles multi-line responses that contain commands mixed with
+        # text.
+
+        # Fix the error "Strings with code points over 0xFF may not be
+        # mapped into in-memory file handles" in SID
+        # AC4E62F6-AB8B-11F0-8381-BEFDF5F59C27
+        my $bytes = encode('UTF-8', $command);
+        open my $sh, '<', \$bytes
+          or die qq[can not open string handle on '$command': $!];
+
+        my ($cmd_name, $cmd_args);
+        my $inside_apply_patch = 0;
+        my $in_patch_block     = 0;
+        my $patch_accumulator  = '';
+        my $filename;
 
       L: while (<$sh>) {
             my $line = $_;
 
-            if (VERBOSE) {
-                say qq[execute_agent_command (MULTI LINE PARSE): '$line'];
+            # Special handling for apply_patch command with multi-line patches
+            if ($line =~ /^,(apply_patch)\s+(\S+)\s+'<<<<<<< ORIGINAL/) {
+                $cmd_name          = 'apply_patch';
+                $filename          = $2;
+                $in_patch_block    = 1;
+                $patch_accumulator = "<<<<<<< ORIGINAL\n";
+                next L;
             }
 
-            my ($cmd_name, $cmd_args);
+        # If we're accumulating a patch, continue until we find the end marker
+            if ($in_patch_block) {
+                $patch_accumulator .= $line;
+                if ($line =~ /^>>>>>>> UPDATED'/) {
+                    $cmd_args = $filename . ' ' . $patch_accumulator;
+                    goto EXECUTE;
+                }
+                next L;
+            }
+
+           # Legacy handling for apply_patch (kept for backward compatibility)
+            if ($line =~ /[>]+ UPDATED/) {
+                $inside_apply_patch = undef;
+                $cmd_args .= $line;
+                $cmd_args = qq[$cmd_args '];
+                goto EXECUTE;
+            }
+
+            # Standard command pattern matching
             if ($line =~ /$command_pat/) {
                 $cmd_name = $1;
                 $cmd_args = $2 // '';
 
-                if (VERBOSE) {
-                    say Dumper {cmd_name => $cmd_name,
-                        cmd_args => $cmd_args,};
+                if ($cmd_name eq 'apply_patch') {
+                    $inside_apply_patch++;
+                }
+                else {
+                    $inside_apply_patch = undef;
                 }
             }
             else {
-                # Skip non-command lines
+                # Handle continuation lines for apply_patch
+                if ($inside_apply_patch) {
+                    $cmd_args .= $line;
+                }
                 next L;
             }
 
+          EXECUTE:
             if (exists $cmd_lookup->{$cmd_name}) {
-
-             # Execute the command through the existing command infrastructure
                 if ($cmd_args) {
                     $cmd_lookup->{$cmd_name}->($cmd_args);
                 }
@@ -1448,24 +2049,15 @@ sub execute_agent_command {
                 push @convo, qq[AGENT ERROR: Unknown command ',$cmd_name'];
             }
         }
+        close $sh;
     }
 
- # CRITICAL FIX: Auto-dump MUST happen before the next get_agent_command call
- # This ensures command output is in the context when building the next prompt
+    # Auto-dump must happen before the next agent command.  This
+    # ensures command output is in the context when building the next
+    # prompt.
     if ($auto_dump_mode && $active_dump_file) {
         $cmd_lookup->{dump}->($active_dump_file);
     }
-}
-
-sub print_agent_typing {
-    my ($text) = @_;
-
-    # Simulate typing effect
-    for my $char (split //, $text) {
-        print $char;
-        select(undef, undef, undef, 0.01);    # 10ms per char
-    }
-    print "\n";
 }
 
 =head1 Synergy - a read-eval-print loop (REPL) for AI assistants
@@ -1489,7 +2081,7 @@ If you go to the Terminal and start C<synergy>, a prompt appears. You can type q
     (1741177286.90149) thinking ...
     In Perl's POD (Plain Old Documentation) format, you can represent a quotation or blockquote using the `=begin` and `=end` blocks with the `text` format. Here's an example: ...
 
-Synergy also accepts special commands starting with a comma. These commands are not sent to the AI assistant. Instead, they control the state of the REPL. For example, you can add a text file into the context of the current conversation, or print out the estimated number of tokens used so far.
+Synergy also accepts special commands starting with a comma. These commands are not sent to the AI assistant. Instead, they control the state of the REPL. For example, you can add a text file into the context of the current conversation, or serialize the current session to disk as an XML file.
 
 When you add a file to the context, it is stored in a stack. There are several stack manipulation commands for pushing, popping, rotating, etc.
 
@@ -1514,33 +2106,54 @@ The complete list of special commands is documented in the interactive help outp
     USER > ,help
     This is Synergy. You are interacting with the command processor.
     A command is either a prose form for the Assistant to evaluate or one of the following:
+
+    General commands:
     ,help ,?			Print this help message
-    ,history			Print out the chat history so far
+    ,exit				Quit the SYNERGY command processor
+
+    History Management:
+    ,history			Print out the conversation history so far
+    ,reset				Discard conversation history and file context (A B C - )
+    ,collect			Replace current conversation history with a summary
+
+    File Context:
     ,s					Print contents of file context stack
     ,push file.txt		Push file.txt onto file context stack (B C - A B C)
-    ,pop				Pop top entry off of file context stack (A B - B)
     ,swap				Swap top two elements of file context stack (A B - B A)
     ,rot				Rotate file context stack entries (A B C - B C A)
     ,drop [N...]		Remove elements of file context stack:
-                         - With no args: same as ,pop
-                         - With arg N: remove element at index N
+                         - With no args: pop top stack element (A B C - B C)
+                         - With arg N: remove element at index N (A B .. N - A B ..)
     ,peek N				View contents of Nth element of file context stack
-    ,reset [N]			Discard history chat history (A B C - )
-                        - With no args: discard entire history
-                        - With arg N: reset history to position N
-    ,collect			Replace current chat history with an Assistant-generated summary
-    ,prompt				Print the current prompt
-    ,model				Print the current model
-    ,tokens				Print the approximate token count in the current chat history
+
+    Session Management:
     ,dump file.xml		Save session history (including current file context stack, if any) to disk
     ,load file.xml		Load session history (including file context stack, if any) from disk
+
+    System Interaction:
     ,pwd				Print current working directory
     ,cd /some/dir		Change working directory to /some/dir
-    ,exec cmd			Execute shell command (grep sed wc ls file cat make), save output to a file on the context stack
-    ,apply_patch file.txt '<<<<<<< SEARCH foo ======= bar >>>>>>> REPLACE'
+    ,exec cmd			Execute shell command (grep sed wc ls file find cat make head)
+                        Output is saved to conversation history
+
+    Agent Interaction:
+    ,agent <prompt>		Prompt the system to complete a task autonomously using this command set.
+                        Agent has access to: ,exec ,apply_patch ,comment
+                        Agent prints a summary of work when completed. Enter Ctrl-C to exit loop.
+    ,apply_patch file.txt '<<<<<<< ORIGINAL
+                           foo
+                           =======
+                           bar
+                           >>>>>>> UPDATED'
                         Apply patch in diff-fenced edit format to file.txt
-    ,comment			Write a comment that is printed back to the REPL's output without calling the Assistant
-    ,exit				Quit the Synergy command processor
+    ,comment			Write a comment that is printed back to the REPL's output.
+                        This is useful for notes to self by humans or AI agents.
+
+    Model Settings:
+    ,model [name]       Print (or switch) the current model
+                        - With no args: Print the current model and the list of options
+                        - With name (e.g., `gpt-5`): Switch to model with that name
+    ,encoded			Base64 encode contents of API calls to the Assistant (default ON)
 
 =head3 Setup
 
@@ -1548,78 +2161,7 @@ The C<synergy> program is written in Perl, and uses a number of libraries that n
 
 You will need to provide an API key:
 
-    $ export LANGERTHA_ANTHROPIC_API_KEY="ABC123..."
-
-=head2 Emacs integration
-
-There is a file C<inf-synergy.el> in this directory that provides some niceties for interacting with Synergy from Emacs, including:
-
-=head3 REPL interaction
-
-=over
-
-=item C<M-x run-synergy>
-
-Start or switch to a Synergy chat buffer.
-
-=item C<C-x C-a y>
-
-Quick shortcut to create or switch to Synergy buffer.
-
-=back
-
-Once in the REPL, the following features are available:
-
-=over
-
-=item C<C-c C-n>
-
-Move forward through commands.
-
-=item C<C-c C-p>
-
-Move backward through commands.
-
-=item C<S-return>
-
-Insert newline without sending input.
-
-=item C<RET>
-
-Send input to Synergy.
-
-=back
-
-Note that the Synergy REPL will highlight any single-line inputs to the REPL that are longer than 999 characters in bright red starting at the 1000th character.
-
-This is necessary because the maximum length of string a comint-based REPL will accept without hanging with '^G' (control-G) characters is 1005 based on my testing. (This applies to both older and more recent Emacs versions, and seems to be controlled b<stdin>:1492: To save a full .LOG file rerun with -g
-y the process interaction layer at the C code level and not user-configurable.)
-
-=head3 File context management
-
-=over
-
-=item C<synergy-push>
-
-Pushes files to Synergy's file context stack.
-
-Pushes current region if a region is selected.
-
-If no region is selected, pushes the entire buffer.
-
-In Dired mode, pushes marked files or just the file at point if nothing is marked.
-
-=back
-
-=head3 Code block handling
-
-=over
-
-=item C<C-x M-w>
-
-Copy code block from Markdown-formatted text.
-
-=back
+    $ export ANTHROPIC_API_KEY="ABC123..."
 
 =head2 Credits
 
