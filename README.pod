@@ -16,7 +16,7 @@ If you go to the Terminal and start C<synergy>, a prompt appears. You can type q
 
     $ synergy
     USER > i am writing perl documentation in the POD format (a README), how do i represent a quotation / blockquote?
-    (1741177286.90149) thinking ...
+
     In Perl's POD (Plain Old Documentation) format, you can represent a quotation or blockquote using the `=begin` and `=end` blocks with the `text` format. Here's an example: ...
 
 Synergy also accepts special commands starting with a comma. These commands are not sent to the AI assistant. Instead, they control the state of the REPL. For example, you can add a text file into the context of the current conversation, or serialize the current session to disk as an XML file.
@@ -38,60 +38,13 @@ The simplest way to talk to Synergy is via one-shot commands over a pipe
 
 =head3 Command processor commands
 
-The complete list of special commands is documented in the interactive help output.
+The complete list of special commands is documented in the interactive help output. Run C<,help> to see it.
 
     $ synergy
     USER > ,help
     This is Synergy. You are interacting with the command processor.
     A command is either a prose form for the Assistant to evaluate or one of the following:
-
-    General commands:
-    ,help ,?			Print this help message
-    ,exit				Quit the SYNERGY command processor
-
-    History Management:
-    ,history			Print out the conversation history so far
-    ,reset				Discard conversation history and file context (A B C - )
-    ,collect			Replace current conversation history with a summary
-
-    File Context:
-    ,s					Print contents of file context stack
-    ,push file.txt		Push file.txt onto file context stack (B C - A B C)
-    ,swap				Swap top two elements of file context stack (A B - B A)
-    ,rot				Rotate file context stack entries (A B C - B C A)
-    ,drop [N...]		Remove elements of file context stack:
-                         - With no args: pop top stack element (A B C - B C)
-                         - With arg N: remove element at index N (A B .. N - A B ..)
-    ,peek N				View contents of Nth element of file context stack
-
-    Session Management:
-    ,dump file.xml		Save session history (including current file context stack, if any) to disk
-    ,load file.xml		Load session history (including file context stack, if any) from disk
-
-    System Interaction:
-    ,pwd				Print current working directory
-    ,cd /some/dir		Change working directory to /some/dir
-    ,exec cmd			Execute shell command (grep sed wc ls file find cat make head)
-                        Output is saved to conversation history
-
-    Agent Interaction:
-    ,agent <prompt>		Prompt the system to complete a task autonomously using this command set.
-                        Agent has access to: ,exec ,apply_patch ,comment
-                        Agent prints a summary of work when completed. Enter Ctrl-C to exit loop.
-    ,apply_patch file.txt '<<<<<<< ORIGINAL
-                           foo
-                           =======
-                           bar
-                           >>>>>>> UPDATED'
-                        Apply patch in diff-fenced edit format to file.txt
-    ,comment			Write a comment that is printed back to the REPL's output.
-                        This is useful for notes to self by humans or AI agents.
-
-    Model Settings:
-    ,model [name]       Print (or switch) the current model
-                        - With no args: Print the current model and the list of options
-                        - With name (e.g., `gpt-5`): Switch to model with that name
-    ,encoded			Base64 encode contents of API calls to the Assistant (default ON)
+    ...
 
 =head3 Setup
 

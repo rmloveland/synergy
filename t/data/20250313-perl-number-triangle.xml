@@ -277,7 +277,7 @@ Here's the reasoning, based on the provided code and the example triangle:
 
 Here are the contents of the files under discussion:
 {{{
-file: '/Users/rloveland/Dropbox/Code/personal/informatics-olympiad/1994/triangle.pl'
+file: 'examples/triangle.pl'
 contents: #!/usr/bin/env perl
 
 use strict;
@@ -449,7 +449,7 @@ Here's the reasoning, based on the provided code and the example triangle:
 ]]></elem>
   </convo>
   <context>
-    <elem><![CDATA[file: '/Users/rloveland/Dropbox/Code/personal/informatics-olympiad/1994/triangle.pl'
+    <elem><![CDATA[file: 'examples/triangle.pl'
 contents: #!/usr/bin/env perl
 
 use strict;
