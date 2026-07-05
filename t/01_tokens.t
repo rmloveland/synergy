@@ -57,9 +57,12 @@ subtest 'openai session totals accumulate across requests' => sub {
 };
 
 subtest 'anthropic usage contributes to session totals' => sub {
+
+    # Anthropic reports only the uncached remainder in input_tokens;
+    # 'input' should be the full prompt: 95 + 2000 written to cache.
     my $stub_path
       = write_stub(
-        '{"content":[{"type":"text","text":"stub anthropic"}],"usage":{"input_tokens":2095,"output_tokens":503,"cache_creation_input_tokens":2095,"cache_read_input_tokens":0}}'
+        '{"content":[{"type":"text","text":"stub anthropic"}],"usage":{"input_tokens":95,"output_tokens":503,"cache_creation_input_tokens":2000,"cache_read_input_tokens":0}}'
       );
 
     my $result = run_synergy(
@@ -73,6 +76,30 @@ subtest 'anthropic usage contributes to session totals' => sub {
         $result->{stdout},
         qr/tokens: input=2095 output=503 total=2598 cached=0 cache_hit_pct=0\.0%/,
         'anthropic totals are reported'
+    );
+};
+
+subtest 'anthropic cache reads keep the hit percentage under 100' => sub {
+
+    # Regression: cache reads are excluded from Anthropic's
+    # input_tokens, so cached/input used to exceed 100% (e.g. 458%).
+    # Full prompt here: 100 uncached + 900 read from cache = 1000.
+    my $stub_path
+      = write_stub(
+        '{"content":[{"type":"text","text":"stub anthropic"}],"usage":{"input_tokens":100,"output_tokens":50,"cache_creation_input_tokens":0,"cache_read_input_tokens":900}}'
+      );
+
+    my $result = run_synergy(
+        stub_path => $stub_path,
+        input     => ",model claude-haiku\nhello\n,tokens\n,exit\n",
+    );
+
+    is($result->{exit}, 0, 'anthropic cached run exits successfully')
+      or diag($result->{stderr}, $result->{stdout});
+    like(
+        $result->{stdout},
+        qr/tokens: input=1000 output=50 total=1050 cached=900 cache_hit_pct=90\.0%/,
+        'cache reads count toward input, bounding the hit percentage'
     );
 };
 

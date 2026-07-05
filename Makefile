@@ -6,14 +6,14 @@ ZIPFILE := synergy-$(VERSION).zip
 
 # Define the list of files for distribution
 TEST_FILES := t/*.t t/lib/Synergy/Test/Runner.pm
-DIST_FILES := $(EXE) README.pod Makefile MANIFEST CHANGELOG $(TEST_FILES) t/data/20250313-perl-number-triangle.xml t/data/20250609-sqlchecker-use-random-database.xml
+DIST_FILES := $(EXE) README.pod README.html Makefile MANIFEST CHANGELOG $(TEST_FILES) t/data/20250313-perl-number-triangle.xml t/data/20250609-sqlchecker-use-random-database.xml
 
 # The MANIFEST file itself is part of DIST_FILES, but its content is
 # derived from other DIST_FILES (excluding itself initially) For
 # checksum, we list the core source files that define the
-# distribution. MANIFEST is generated, so it is not checksummed
-# directly from source control.
-MANIFEST_SOURCES := Makefile README.pod $(EXE) $(TEST_FILES) t/data/20250313-perl-number-triangle.xml t/data/20250609-sqlchecker-use-random-database.xml
+# distribution.  README.html and MANIFEST are generated, so they are
+# not checksummed directly from source control.
+MANIFEST_SOURCES := Makefile README.pod README.html $(EXE) $(TEST_FILES) t/data/20250313-perl-number-triangle.xml t/data/20250609-sqlchecker-use-random-database.xml
 
 all: test install clean
 

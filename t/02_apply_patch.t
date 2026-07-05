@@ -963,6 +963,60 @@ EOF
     );
 }
 
+=head3 Test ,apply_patch fallback: CR-only line endings
+
+Scenario: The file uses bare carriage returns (classic Mac line
+endings) while the patch uses LF. The exact match misses, so the
+line-ending fallback pass must find the unique whole-line match.
+(The agent CRLF fallback test lives in t/07; nothing else pins CR.)
+
+=cut
+
+{
+    my $test_file = "$temp_dir_simple/apply_patch_cr_only.txt";
+    open my $fh, '>', $test_file or die "cannot write $test_file: $!";
+    print $fh "alpha\rbeta\rgamma\r";
+    close $fh;
+
+    my $diff_content = <<'EOF_DIFF';
+<<<<<< ORIGINAL
+alpha
+beta
+=======
+alpha
+BETA
+>>>>>> UPDATED
+EOF_DIFF
+    chomp $diff_content;
+    $diff_content =~ s/\n/<NL>/g;
+
+    my $res = run_synergy_session(
+        [
+            ",cd $temp_dir_simple\n",
+            ",apply_patch $test_file '$diff_content'\n",
+            ",exit\n"
+        ]
+    );
+
+    like(
+        $res->{stdout},
+        qr/apply_patch: Applied edits to file '\Q$test_file\E'/,
+        "apply_patch cr-only: patch applied via line-ending fallback"
+    );
+    unlike(
+        $res->{stdout},
+        qr/WARNING: Search text not found/,
+        "apply_patch cr-only: no search-miss warning"
+    );
+
+    my $patched = slurp($test_file);
+    like($patched, qr/BETA/, "apply_patch cr-only: updated content present");
+    unlike($patched, qr/beta/,
+        "apply_patch cr-only: original content replaced");
+    like($patched, qr/gamma\r/,
+        "apply_patch cr-only: untouched CR line ending preserved");
+}
+
 =head3 Test ,apply_patch command (patching an empty file to add content)
 
 Scenario: Target file exists but is empty. Patch adds new lines.
@@ -2036,12 +2090,10 @@ EOF
 #  first-match-only replacement semantics, and content that collides
 #  with apply_patch's own syntax.
 #
-#  IMPORTANT: The REPL command regex character class does NOT include
-#  the characters: % ~ + & \t (tab).  Patches containing these
-#  characters will be truncated when sent via multi-line STDIN.  Tests
-#  that need these characters must use <NL> encoding (single-line path).
-#
 #  Edge cases for subtle apply_patch parser/application behavior.
+#  (The REPL dispatch used to truncate arguments at % ~ + & and tab;
+#  it now passes command arguments through verbatim, so multi-line
+#  STDIN and <NL>-encoded patches are equally capable.)
 # =====================================================================
 
 
@@ -2776,11 +2828,11 @@ EOF
         "apply_patch substring: standalone foo untouched (not first match)");
 }
 
-=head3 Test ,apply_patch: REPL command regex truncation (known limitation)
+=head3 Test ,apply_patch: multi-line STDIN patch with %, +, ~, & and tab
 
-Documents that %, +, ~, &, and tab in multi-line STDIN patches cause
-the REPL command regex to truncate the argument.  The workaround is
-<NL> encoding.
+These characters used to be truncated by the REPL command regex's
+argument character class (the old workaround was <NL> encoding).  The
+dispatch now passes arguments through verbatim, so such patches apply.
 
 =cut
 
@@ -2790,12 +2842,11 @@ the REPL command regex to truncate the argument.  The workaround is
     print $fh "my \%hash = ();\n";
     close $fh;
 
-    # Multi-line STDIN path -- the % will truncate $maybe_arg
-    my $diff_content = <<'EOF';
+    my $diff_content = <<"EOF";
 <<<<<< ORIGINAL
-my %hash = ();
+my \%hash = ();
 =======
-my %hash = (key => 1);
+my \%hash = (key => 1 + 2);\t# ~tilde & ampersand
 >>>>>> UPDATED
 EOF
 
@@ -2809,15 +2860,15 @@ EOF
 
     like(
         $res->{stdout},
-        qr/ERROR: No valid edit blocks found in diff text/,
-        "apply_patch charclass-limit: multi-line STDIN truncates at % (known limitation)"
+        qr/apply_patch: Applied edits to file '\Q$test_file\E'/,
+        "apply_patch charclass: multi-line STDIN patch with % + ~ & tab applies"
     );
 
     my $patched = slurp($test_file);
-    like(
+    is(
         $patched,
-        qr/my %hash = \(\);/,
-        "apply_patch charclass-limit: file unchanged after truncated patch"
+        "my \%hash = (key => 1 + 2);\t# ~tilde & ampersand\n",
+        "apply_patch charclass: special characters survive verbatim"
     );
 }
 

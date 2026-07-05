@@ -332,7 +332,7 @@ already match `dump-<UUID>-<TS>.xml`.
 
     my $dump_xml = slurp($p1);
     my ($dump_session_id)
-      = ($dump_xml =~ /<dump time="[^"]+" session="([^"]+)">/);
+      = ($dump_xml =~ /<dump time="[^"]+" session="([^"]+)"/);
     ok(
         defined $dump_session_id,
         "autodump after assistant reply: first dump file records a session id"
@@ -470,6 +470,108 @@ just for testing.
         qr/\[ \]/, ",reset - confirm file context stack is cleared");
 }
 
+=head3 Test dump records the model and load switches back to it
+
+=cut
+
+{
+    my $dump_file = "$temp_dir/model_roundtrip_dump.xml";
+
+    my $dump_results = run_synergy_session(
+        [",model claude-haiku\n", ",dump $dump_file\n", ",exit\n"]);
+    is($dump_results->{exit_code}, 0, "model roundtrip: dump run exits ok");
+
+    my $dump_xml = slurp($dump_file);
+    like(
+        $dump_xml,
+        qr/<dump [^>]*model="claude-haiku"/,
+        "model roundtrip: dump stores the active model short name"
+    );
+
+    # Fresh session starts on the default model; loading should switch.
+    my $load_results
+      = run_synergy_session([",load $dump_file\n", ",model\n", ",exit\n"]);
+    like(
+        $load_results->{stdout},
+        qr/Loading model\s+\.\.\. ok/,
+        "model roundtrip: load reports the stored model"
+    );
+    like(
+        $load_results->{stdout},
+        qr/Switched model to 'claude-haiku'/,
+        "model roundtrip: load switches to the dumped model"
+    );
+    like(
+        $load_results->{stdout},
+        qr/^\s+\* claude-haiku /m,
+        "model roundtrip: ,model shows the dumped model as current"
+    );
+}
+
+=head3 Test loading an old dump without a model attribute
+
+=cut
+
+{
+    my $legacy_file = "$temp_dir/legacy_no_model_dump.xml";
+    open my $lfh, '>', $legacy_file or die "Cannot create $legacy_file: $!";
+    print $lfh
+      qq[<dump time="0" session="LEGACY-SESSION">\n  <convo>\n  </convo>\n  <context>\n  </context>\n</dump>\n];
+    close $lfh;
+
+    my $results
+      = run_synergy_session([",load $legacy_file\n", ",model\n", ",exit\n"]);
+    is($results->{exit_code}, 0, "legacy dump: load run exits ok");
+    unlike(
+        $results->{stdout},
+        qr/Switched model to|unknown model/,
+        "legacy dump: no model switch and no warning"
+    );
+    like(
+        $results->{stdout},
+        qr/^\s+\* gpt-5 /m,
+        "legacy dump: default model stays current"
+    );
+}
+
+=head3 Test dump/load round-trips UTF-8 as characters
+
+Dumps are base64 over UTF-8 bytes; loading must decode back to
+characters, not leave byte strings in the history (which would be
+double-encoded on display and in later requests).
+
+=cut
+
+{
+    my $dump_file = "$temp_dir/utf8_roundtrip_$$.xml";
+
+    # STDIN is :utf8 via utf8::all, so these UTF-8 bytes arrive as
+    # the characters: unicode note "curly" (curly quotes) plus a
+    # bullet.
+    my $session1 = run_synergy_session(
+        [
+            ",comment unicode note \xe2\x80\x9ccurly\xe2\x80\x9d \xe2\x97\x8f here\n",
+            ",dump $dump_file\n",
+            ",exit\n"
+        ]
+    );
+    is($session1->{exit_code},
+        0, "utf8 roundtrip: dump session exits cleanly");
+    ok(-f $dump_file, "utf8 roundtrip: dump file written");
+
+    my $session2
+      = run_synergy_session([",load $dump_file\n", ",history\n", ",exit\n"]);
+
+    is($session2->{exit_code},
+        0, "utf8 roundtrip: load session exits cleanly");
+    like(
+        $session2->{stdout},
+        qr/unicode note \xe2\x80\x9ccurly\xe2\x80\x9d \xe2\x97\x8f here/,
+        "utf8 roundtrip: history shows single-encoded UTF-8 after load"
+    );
+    unlike($session2->{stdout}, qr/\xc3\xa2\xc2/,
+        "utf8 roundtrip: no double-encoding fingerprint after load");
+}
 
 done_testing();
 

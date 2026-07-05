@@ -223,9 +223,11 @@ close $url_fh;
 
 my $response = '{"output":[{"content":[{"type":"output_text","text":"OK_OPENAI"}]}]}';
 if (($url // '') =~ /anthropic\.com/) {
-    $response = '{"content":[{"text":"OK_ANTHROPIC"}]}';
+    $response = '{"content":[{"type":"text","text":"OK_ANTHROPIC"}]}';
 } elsif (($url // '') =~ /generativelanguage\.googleapis\.com/) {
     $response = '{"candidates":[{"content":{"parts":[{"text":"OK_GEMINI"}]}}]}';
+} elsif (($url // '') =~ /fireworks\.ai/) {
+    $response = '{"choices":[{"message":{"role":"assistant","content":"OK_FIREWORKS"}}]}';
 }
 
 if (($ENV{SYNERGY_CURL_FAKE_CACHE_PROVIDER} // '') eq 'anthropic') {

@@ -23,7 +23,63 @@ my $original_cwd = abs_path();
 my $env     = setup_test_env(log_dir => $temp_dir, dump_dir => $temp_dir);
 my $SYNERGY = $env->{synergy_script};
 
-plan tests => 21;
+plan tests => 38;
+
+use File::Slurp qw(slurp);
+
+# 0) Output cap: oversized command output is stored as head + tail with
+#    an elision marker; the temp file keeps the full output.
+{
+    my $big_file = "$temp_dir/exec_output_cap.txt";
+    open my $fh, '>', $big_file or die "Cannot create $big_file: $!";
+    print {$fh} "HEAD_CAP_MARK\n", ("filler line for the cap test\n" x 100),
+      "TAIL_CAP_MARK\n";
+    close $fh;
+
+    my $res = run_synergy_session(
+        [",exec cat $big_file\n", ",exit\n"],
+        undef, {SYNERGY_EXEC_OUTPUT_CAP => 400},
+    );
+
+    like($res->{stdout}, qr/HEAD_CAP_MARK/,
+        "exec output cap: head of oversized output is kept");
+    like($res->{stdout}, qr/TAIL_CAP_MARK/,
+        "exec output cap: tail of oversized output is kept");
+    like(
+        $res->{stdout},
+        qr/\[\.\.\. \d+ bytes elided; full output in '[^']+' \.\.\.\]/,
+        "exec output cap: elision marker names the full-output file"
+    );
+
+    my ($saved_file) = ($res->{stdout} =~ /exec: output saved to '([^']+)'/);
+    ok($saved_file && -f $saved_file,
+        "exec output cap: full-output temp file exists");
+    my $saved = $saved_file ? slurp($saved_file) : '';
+    is(($saved =~ tr/\n//),
+        102 + 3, "exec output cap: temp file keeps the complete output");
+}
+
+# 0b) Output cap disabled: SYNERGY_EXEC_OUTPUT_CAP=0 stores everything.
+{
+    my $big_file = "$temp_dir/exec_output_cap_off.txt";
+    open my $fh, '>', $big_file or die "Cannot create $big_file: $!";
+    print {$fh} ("uncapped filler line\n" x 100), "UNCAPPED_TAIL_MARK\n";
+    close $fh;
+
+    my $res = run_synergy_session(
+        [",exec cat $big_file\n", ",exit\n"],
+        undef, {SYNERGY_EXEC_OUTPUT_CAP => 0},
+    );
+
+    unlike(
+        $res->{stdout},
+        qr/bytes elided/,
+        "exec output cap off: no elision marker"
+    );
+    my @filler = ($res->{stdout} =~ /uncapped filler line/g);
+    is(scalar @filler,
+        100, "exec output cap off: full output stored verbatim");
+}
 
 # 1) shellwords: preserve spaces within quotes
 {
@@ -54,14 +110,28 @@ plan tests => 21;
     );
 }
 
-# 3) Metacharacters should be inert (no shell). Semicolon should not split commands.
+# 3) Commands outside the allowlist run for the human (confirm tier:
+# typing the command is the approval). Only the deny tier blocks.
 {
-    my $res = run_synergy_session([",exec echo not_allowed\n", ",exit\n"]);
+    my $res = run_synergy_session([",exec echo now_allowed\n", ",exit\n"]);
 
+    like($res->{stdout}, qr/OUTPUT:\nnow_allowed/,
+        "exec confirm tier: unknown command runs for the human");
+
+    my $deny
+      = run_synergy_session([",exec bash -c 'echo nope'\n", ",exit\n"]);
     like(
-        $res->{stdout},
-        qr/ERROR: Command 'echo' not allowed/,
-        "exec allowlist: still enforced"
+        $deny->{stdout},
+        qr/ERROR: Command 'bash' is not permitted in ,exec/,
+        "exec deny tier: shell interpreters blocked for the human"
+    );
+
+    my $git_deny = run_synergy_session(
+        [",exec git push --force origin main\n", ",exit\n"]);
+    like(
+        $git_deny->{stdout},
+        qr/ERROR: git push --force is not permitted/,
+        "exec deny tier: destructive git blocked for the human"
     );
 }
 
@@ -103,28 +173,74 @@ plan tests => 21;
     );
 }
 
-# 7) git commit with unquoted multi-word -m should be rejected early.
+# 6b) Pipelines: unquoted '|' splits segments; each segment is
+# policy-checked; other shell operators are rejected.
 {
     my $res = run_synergy_session(
-        [
-            ",exec git commit -m Add replace review navigation and undo status\n",
-            ",exit\n"
-        ]
+        [",exec printf 'x\\ny\\nz\\n' | wc -l\n", ",exit\n"]);
+    like($res->{stdout}, qr/OUTPUT:\n\s*3\n/,
+        "exec pipeline: two-segment pipeline runs and pipes data");
+
+    my $three = run_synergy_session(
+        [",exec cat /etc/hosts | head -50 | wc -l\n", ",exit\n"]);
+    like(
+        $three->{stdout},
+        qr/exec: cat \/etc\/hosts \| head -50 \| wc -l/,
+        "exec pipeline: three segments accepted and displayed with pipes"
     );
 
+    my $quoted
+      = run_synergy_session([",exec rg -n 'one|two' /dev/null\n", ",exit\n"]);
+    unlike($quoted->{stdout}, qr/ERROR:/,
+        "exec pipeline: quoted '|' stays inside the argument, no split");
     like(
-        $res->{stdout},
-        qr/ERROR: git commit message arguments must be quoted; use git commit -m "subject" -m "body" or git commit -F file/,
-        "exec git commit: rejects unquoted multi-word -m message"
+        $quoted->{stdout},
+        qr/exec: rg -n one\|two \/dev\/null/,
+        "exec pipeline: quoted '|' passed to the command as one argv"
+    );
+
+    my $deny = run_synergy_session(
+        [",exec cat /etc/hosts | rm -f /tmp/nope\n", ",exit\n"]);
+    like(
+        $deny->{stdout},
+        qr/ERROR: Command 'rm' is not permitted in ,exec/,
+        "exec pipeline: a denied segment blocks the whole pipeline"
     );
     unlike(
-        $res->{stdout},
-        qr/exec: git commit -m Add replace review navigation and undo status/,
-        "exec git commit: invalid command is not executed"
+        $deny->{stdout},
+        qr/exec: output saved to/,
+        "exec pipeline: denied pipeline does not execute any segment"
+    );
+
+    for my $case (
+        [",exec cat a; cat b\n",   qr/shell operator ';'/,    'semicolon'],
+        [",exec cat a && cat b\n", qr/shell operator '&'/,    'and-chain'],
+        [",exec cat a || cat b\n", qr/shell operator '\|\|'/, 'or-chain'],
+        [",exec cat < a\n",        qr/shell operator '<'/, 'stdin redirect'],
+      )
+    {
+        my ($input, $pattern, $label) = @$case;
+        my $r = run_synergy_session([$input, ",exit\n"]);
+        like($r->{stdout}, $pattern,
+            "exec operator rejection: $label rejected");
+    }
+
+    my $empty_seg
+      = run_synergy_session([",exec cat a | | cat b\n", ",exit\n"]);
+    like(
+        $empty_seg->{stdout},
+        qr/ERROR: empty pipeline segment in ,exec command/,
+        "exec pipeline: empty segment rejected"
+    );
+
+    my $arg_spaces = run_synergy_session(
+        [qq[,exec printf '%s\\n' 'hello world' | wc -l\n], ",exit\n"]);
+    like($arg_spaces->{stdout}, qr/OUTPUT:\n\s*1\n/,
+        "exec pipeline: quoted arg with spaces survives requoting into the pipe"
     );
 }
 
-# 7b) Git commands should not inherit a configured pager.
+# 7) Git commands should not inherit a configured pager.
 {
     my $pager = "$temp_dir/fake-pager";
     open my $pfh, '>', $pager or die "Cannot create $pager: $!";
@@ -149,23 +265,6 @@ plan tests => 21;
     );
     unlike($res->{stdout}, qr/PAGER_INVOKED/,
         "exec git pager: inherited pager is suppressed");
-}
-
-# 8) rg with a suspicious unquoted multi-word pattern should be rejected early.
-{
-    my $res = run_synergy_session(
-        [qq[,exec rg -n ERROR: No command provided $SYNERGY\n], ",exit\n"]);
-
-    like(
-        $res->{stdout},
-        qr/ERROR: rg search patterns containing spaces must be quoted; use quotes around the pattern, e\.g\. rg -n "ERROR: No command provided" path/,
-        "exec rg quoting: rejects suspicious unquoted multi-word pattern"
-    );
-    unlike(
-        $res->{stdout},
-        qr/rg: No: No such file or directory/,
-        "exec rg quoting: invalid search does not reach rg"
-    );
 }
 
 END {

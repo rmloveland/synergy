@@ -100,10 +100,57 @@ my $bell = chr 7;
     );
     like(
         $results->{stdout},
-        qr/,shell\s+cmd\s+Execute an arbitrary shell command via \/bin\/sh -lc/,
-        "help: documents shell"
+        qr/,exec\s+cmd\s+Execute a command, or a '\|' pipeline of commands/,
+        "help: documents exec pipelines"
     );
+    unlike($results->{stdout}, qr/,shell\s+cmd/, "help: ,shell is gone");
     is($results->{exit_code}, 0, "help: exits cleanly");
+}
+
+=head3 Test dispatch fallback: comma lines never reach the assistant
+
+Any line whose first non-blank character is a comma is a command.
+,? and bare , work only via the help fallback, and unknown commands
+(including arguments with characters the old dispatch character class
+rejected) must print help rather than being sent to the assistant.
+
+=cut
+
+{
+    my $results = run_synergy_session(
+        [",?\n", ",\n", ",bogus 50% + ~x & y\n", ",exit\n"],
+        undef, {SYNERGY_OFFLINE_RESPONSE => 'ASSISTANT_SENTINEL_REPLY'},
+    );
+
+    my @help_intros
+      = ($results->{stdout}
+          =~ /(This is Synergy\. You are interacting with the command processor\.)/g
+      );
+    is(scalar @help_intros,
+        3, "dispatch: ',?', bare ',', and unknown command each print help");
+    unlike($results->{stdout}, qr/ASSISTANT_SENTINEL_REPLY/,
+        "dispatch: comma lines are never sent to the assistant");
+    is($results->{exit_code}, 0, "dispatch: fallback exits cleanly");
+}
+
+=head3 Test ,exec passes formerly-truncated metacharacters verbatim
+
+The old dispatch character class silently dropped %, +, ~, and & from
+command arguments. Pin that the generic dispatch passes them through,
+and that quoted shell operators are ordinary argument text.
+
+=cut
+
+{
+    my $results
+      = run_synergy_session([",exec echo '50% + ~x & y'\n", ",exit\n"]);
+
+    like(
+        $results->{stdout},
+        qr/^50% \+ ~x & y$/m,
+        "exec: % + ~ & survive dispatch and reach the command verbatim"
+    );
+    is($results->{exit_code}, 0, "exec: metacharacter case exits cleanly");
 }
 
 =head3 Test ,collect command
@@ -171,6 +218,122 @@ my $bell = chr 7;
         "collect: request includes collect instruction"
     );
     is($results->{exit_code}, 0, "collect: exits cleanly");
+}
+
+=head3 Test automatic compaction triggers on the token threshold
+
+When the last server-reported prompt size crosses the compaction
+threshold, the next turn must first run a compaction call and rewrite
+the history to the summary plus retained verbatim user messages,
+dropping assistant replies. The turn after compaction must not
+re-trigger (the check waits for fresh server-reported usage).
+
+=cut
+
+{
+    my $capture_dir = tempdir(CLEANUP => 1);
+    my $curl_dir    = tempdir(CLEANUP => 1);
+    write_fake_curl($curl_dir);
+
+    my %env = (
+        SYNERGY_CURL_CAPTURE_DIR   => $capture_dir,
+        PATH                       => "$curl_dir:$ENV{PATH}",
+        OPENAI_API_KEY             => 'OPENAI_KEY_TEST',
+        SYNERGY_AUTOCOMPACT_TOKENS => 1000,
+        SYNERGY_CURL_FAKE_BODY_1   =>
+          '{"output_text":"FIRST_REPLY","usage":{"input_tokens":50000,"output_tokens":10}}',
+        SYNERGY_CURL_FAKE_BODY_2 =>
+          '{"output_text":"HANDOFF_SUMMARY","usage":{"input_tokens":90,"output_tokens":10}}',
+        SYNERGY_CURL_FAKE_BODY_3 =>
+          '{"output_text":"SECOND_REPLY","usage":{"input_tokens":120,"output_tokens":10}}',
+    );
+
+    my $results = run_synergy_session(
+        [
+            ",model gpt-5\n",
+            "remember the magic word xyzzy\n",
+            "what is the magic word\n",
+            ",exit\n"
+        ],
+        undef,
+        \%env,
+    );
+    is($results->{exit_code}, 0, "autocompact: session exits cleanly");
+
+    like(
+        $results->{stdout},
+        qr/collect: auto-compacting conversation history \(50000 tokens >= 1000 token threshold\)/,
+        "autocompact: trigger reports measured tokens and threshold"
+    );
+    like(
+        $results->{stdout},
+        qr/collect: conversation history compacted into a handoff summary/,
+        "autocompact: compaction runs"
+    );
+    like(
+        $results->{stdout},
+        qr/NOTE: Long threads and repeated compactions reduce model accuracy/,
+        "autocompact: advisory is printed"
+    );
+
+    my @bodies = sort glob("$capture_dir/req_*_body.json");
+    is(scalar @bodies,
+        3, "autocompact: turn, compaction call, turn - and no re-trigger");
+
+    my $compaction = decode_json(slurp($bodies[1]));
+    like(
+        $compaction->{input}[0]{content},
+        qr/CONTEXT CHECKPOINT COMPACTION/,
+        "autocompact: compaction call uses the checkpoint prompt"
+    );
+
+    my $after   = decode_json(slurp($bodies[2]));
+    my @content = map { $_->{content} // '' } @{$after->{input}};
+    ok(
+        (grep {/^COLLECTED CONTEXT:\nHANDOFF_SUMMARY/} @content),
+        "autocompact: rewritten history leads with the summary"
+    );
+    ok(
+        (grep { $_ eq 'remember the magic word xyzzy' } @content),
+        "autocompact: recent user message retained verbatim"
+    );
+    ok(!(grep {/FIRST_REPLY/} @content),
+        "autocompact: prior assistant reply dropped from history");
+}
+
+=head3 Test automatic compaction can be disabled
+
+=cut
+
+{
+    my $capture_dir = tempdir(CLEANUP => 1);
+    my $curl_dir    = tempdir(CLEANUP => 1);
+    write_fake_curl($curl_dir);
+
+    my %env = (
+        SYNERGY_CURL_CAPTURE_DIR   => $capture_dir,
+        PATH                       => "$curl_dir:$ENV{PATH}",
+        OPENAI_API_KEY             => 'OPENAI_KEY_TEST',
+        SYNERGY_AUTOCOMPACT_TOKENS => 0,
+        SYNERGY_CURL_FAKE_BODY_1   =>
+          '{"output_text":"REPLY_A","usage":{"input_tokens":50000,"output_tokens":10}}',
+        SYNERGY_CURL_FAKE_BODY_2 =>
+          '{"output_text":"REPLY_B","usage":{"input_tokens":51000,"output_tokens":10}}',
+    );
+
+    my $results
+      = run_synergy_session(
+        [",model gpt-5\n", "turn a\n", "turn b\n", ",exit\n"],
+        undef, \%env,);
+    is($results->{exit_code}, 0, "autocompact off: session exits cleanly");
+
+    unlike(
+        $results->{stdout},
+        qr/auto-compacting conversation history/,
+        "autocompact off: threshold zero disables the check"
+    );
+    my @bodies = glob("$capture_dir/req_*_body.json");
+    is(scalar @bodies, 2, "autocompact off: no compaction call made");
 }
 
 =head3 Test ,pwd command
@@ -369,7 +532,7 @@ EOF
 
     my $dump_xml = slurp($dump_file);
     my ($loaded_session_id)
-      = ($dump_xml =~ /<dump time="[^"]+" session="([^"]+)">/);
+      = ($dump_xml =~ /<dump time="[^"]+" session="([^"]+)"/);
     ok($loaded_session_id, "load: dump file exposes session id");
 
     my $pre_marker       = "pre-load log marker $$";
@@ -654,187 +817,6 @@ EOF
         qr/file: '/, "cross-compat: v2 file context restored");
 }
 
-=head3 Test ,swap command
-
-=cut
-
-{
-    # Create 5 test files
-    my @test_files;
-    for my $i (1 .. 5) {
-        my $test_file = "$temp_dir/$i.txt";
-        open my $fh, '>', $test_file or die "Cannot create test file $i: $!";
-        print $fh "$i.txt\n";
-        close $fh;
-        push @test_files, $test_file;
-    }
-
-    # Push all 5 files onto the stack
-    my @push_commands = map {",push $_\n"} @test_files;
-
-    # Test swap: should swap top two elements (4.txt and 5.txt)
-    # Stack before: [1.txt, 2.txt, 3.txt, 4.txt, 5.txt]
-    # Stack after:  [1.txt, 2.txt, 3.txt, 5.txt, 4.txt]
-    my $results
-      = run_synergy_session([@push_commands, ",swap\n", ",s\n", ",exit\n",]);
-
-    like(
-        $results->{stdout},
-        qr{\[3\]: file: '$test_files[4]'},
-        "swap: moves 5.txt to second from top of stack"
-    );
-    like(
-        $results->{stdout},
-        qr{\* \[4\]: file: '$test_files[3]'}s,
-        "swap: 4.txt should be on top of stack"
-    );
-    like(
-        $results->{stdout},
-        qr/file: '\Q$test_files[2]\E'/,
-        "swap: 3.txt remains in middle"
-    );
-    like(
-        $results->{stdout},
-        qr/file: '\Q$test_files[0]\E'/,
-        "swap: 1.txt remains at bottom"
-    );
-}
-
-=head3 Test ,rot command
-
-=cut
-
-{
-    # Create 6 test files for rotation testing
-    my @test_files;
-    for my $i (1 .. 6) {
-        my $test_file = "$temp_dir_simple/$i.txt";
-        open my $fh, '>', $test_file or die "Cannot create test file $i: $!";
-        print $fh "$i.txt\n";
-        close $fh;
-        push @test_files, $test_file;
-    }
-
-    # Push all 6 files onto the stack
-    my @push_commands = map {",push $_\n"} @test_files;
-
-    # Test rot: should move bottom element to top
-    # Stack before: [1.txt, 2.txt, 3.txt, 4.txt, 5.txt, 6.txt]
-    # Stack after:  [2.txt, 3.txt, 4.txt, 5.txt, 6.txt, 1.txt]
-    my $results
-      = run_synergy_session([@push_commands, ",rot\n", ",s\n", ",exit\n",]);
-
-    like(
-        $results->{stdout},
-        qr/file: '\Q$test_files[0]\E'/,    # 1.txt should now be at top
-        "rot: moves bottom element (1.txt) to top"
-    );
-    like(
-        $results->{stdout},
-        qr/file: '\Q$test_files[5]\E'.*file: '\Q$test_files[0]\E'/s,
-        "rot: 6.txt should be second from top"
-    );
-    like(
-        $results->{stdout},
-        qr/file: '\Q$test_files[1]\E'/,
-        "rot: 2.txt should now be at bottom"
-    );
-    like(
-        $results->{stdout},
-        qr/   \[0\]: file: '\Q$test_files[5]\E' contents: 6\.txt/s,
-        "rot: 5.txt should not be followed by 6.txt (order changed)"
-    );
-}
-
-=head3 Test ,swap and ,rot combination
-
-=cut
-
-{
-    # Create 4 test files for combination testing
-    my @test_files;
-    for my $i (1 .. 4) {
-        my $test_file = "$temp_dir/$i.txt";
-        open my $fh, '>', $test_file or die "Cannot create test file $i: $!";
-        print $fh "$i.txt\n";
-        close $fh;
-        push @test_files, $test_file;
-    }
-
-    # Push all 4 files onto the stack
-    my @push_commands = map {",push $_\n"} @test_files;
-
-    # Test combination: swap then rot
-    # Initial:     [1.txt, 2.txt, 3.txt, 4.txt]
-    # After swap:  [1.txt, 2.txt, 4.txt, 3.txt]
-    # After rot:   [2.txt, 4.txt, 3.txt, 1.txt]
-    my $results = run_synergy_session(
-        [@push_commands, ",swap\n", ",rot\n", ",s\n", ",exit\n",]);
-
-    like(
-        $results->{stdout},
-        qr/file: '\Q$test_files[0]\E'/,    # 1.txt should be at top after rot
-        "swap+rot: 1.txt at top after combination"
-    );
-    like(
-        $results->{stdout},
-        qr/file: '\Q$test_files[2]\E'.*file: '\Q$test_files[0]\E'/s,
-        "swap+rot: 3.txt second from top"
-    );
-    like(
-        $results->{stdout},
-        qr/file: '\Q$test_files[1]\E'/,
-        "swap+rot: 2.txt should be at bottom"
-    );
-}
-
-=head3 Test ,swap on stack with only one element
-
-=cut
-
-{
-    # Create 1 test file
-    my $test_file = "$temp_dir/single.txt";
-    open my $fh, '>', $test_file or die "Cannot create test file: $!";
-    print $fh "single.txt\n";
-    close $fh;
-
-    # Test swap with only one element (should handle gracefully)
-    my $results = run_synergy_session(
-        [",push $test_file\n", ",swap\n", ",s\n", ",exit\n",]);
-
-    like(
-        $results->{stdout},
-        qr/file: '\Q$test_file\E'/,
-        "swap: single element remains unchanged"
-    );
-    is($results->{exit_code}, 0, "swap: single element exits cleanly");
-}
-
-=head3 Test ,rot on empty stack
-
-=cut
-
-{
-    # Test rot on empty stack (should handle gracefully)
-    my $results = run_synergy_session([",rot\n", ",s\n", ",exit\n",]);
-
-    like($results->{stdout}, qr/\[ \]/, "rot: empty stack remains empty");
-    is($results->{exit_code}, 0, "rot: empty stack exits cleanly");
-}
-
-=head3 Test ,swap on empty stack
-
-=cut
-
-{
-    # Test rot on empty stack (should handle gracefully)
-    my $results = run_synergy_session([",swap\n", ",s\n", ",exit\n",]);
-
-    like($results->{stdout}, qr/\[ \]/, "swap: empty stack remains empty");
-    is($results->{exit_code}, 0, "swap: empty stack exits cleanly");
-}
-
 =head3 Test ,exec command (basic functionality)
 
 =cut
@@ -877,7 +859,9 @@ EOF
     );
 }
 
-=head3 Test ,exec command (invalid command)
+=head3 Test ,exec command (blocked command)
+
+The deny tier applies to everyone, human or agent.
 
 =cut
 
@@ -887,13 +871,13 @@ EOF
 
     like(
         $results->{stdout},
-        qr/ERROR: Command 'rm' not allowed in ,exec mode/,
-        "exec: rejects disallowed commands"
+        qr/ERROR: Command 'rm' is not permitted in ,exec/,
+        "exec: rejects blocked commands"
     );
-    like(
+    unlike(
         $results->{stdout},
-        qr/Allowed commands:/,
-        "exec: shows list of allowed commands"
+        qr/exec: output saved to/,
+        "exec: blocked command is not executed"
     );
 }
 
@@ -946,7 +930,84 @@ they should work.
     );
 }
 
-=head3 Test ,shell command
+=head3 Test ,exec runs commands outside the allowlist for the human
+
+The confirm tier needs no prompt on the human path: typing the
+command is the approval.
+
+=cut
+
+{
+    my $results = run_synergy_session([",exec printf hello\n", ",exit\n",]);
+
+    like(
+        $results->{stdout},
+        qr/exec: printf hello/,
+        "exec: shows command being executed"
+    );
+    like(
+        $results->{stdout},
+        qr/exec: output saved to '\/tmp\/synergy_exec_pid_\d+_timestamp_\d+\.\d+\.txt'/,
+        "exec: indicates output file location"
+    );
+    like(
+        $results->{stdout},
+        qr/COMMAND:\nprintf hello\nOUTPUT:\nhello/,
+        "exec: confirm-tier command runs without prompting the human"
+    );
+    is($results->{exit_code}, 0, "exec: basic command exits cleanly");
+}
+
+=head3 Test ,exec command supports pipelines
+
+=cut
+
+{
+    my $results = run_synergy_session(
+        [",exec printf 'a\\nb\\n' | sed -n 2p\n", ",exit\n",]);
+
+    like(
+        $results->{stdout},
+        qr/COMMAND:\nprintf a\\nb\\n \| sed -n 2p\nOUTPUT:\nb\n/,
+        "exec: pipeline is executed segment by segment"
+    );
+    is($results->{exit_code}, 0, "exec: pipeline exits cleanly");
+}
+
+=head3 Test ,exec command rejects redirection
+
+=cut
+
+{
+    my $redirect_file = "$temp_dir/exec_redirect_capture.txt";
+    my $results       = run_synergy_session(
+        [",exec printf hello > $redirect_file\n", ",exit\n",]);
+
+    like(
+        $results->{stdout},
+        qr/ERROR: shell operator '>' is not supported in ,exec \(only '\|' pipelines\)/,
+        "exec: redirection is rejected with a specific error"
+    );
+    ok(!-e $redirect_file, "exec: rejected redirect creates no file");
+    is($results->{exit_code}, 0, "exec: redirect rejection exits cleanly");
+}
+
+=head3 Test ,exec command handles non-zero exit
+
+=cut
+
+{
+    my $results = run_synergy_session([",exec false\n", ",exit\n",]);
+
+    like(
+        $results->{stdout},
+        qr/WARNING: Command exited with status 1/,
+        "exec: non-zero exit is reported"
+    );
+    is($results->{exit_code}, 0, "exec: non-zero exit does not kill REPL");
+}
+
+=head3 Test ,shell command is gone
 
 =cut
 
@@ -955,92 +1016,12 @@ they should work.
 
     like(
         $results->{stdout},
-        qr/shell: printf hello/,
-        "shell: shows command being executed"
+        qr/This is Synergy\. You are interacting with the command processor\./,
+        "shell: removed command falls through to help"
     );
-    like(
-        $results->{stdout},
-        qr/shell: output saved to '\/tmp\/synergy_shell_pid_\d+_timestamp_\d+\.\d+\.txt'/,
-        "shell: indicates output file location"
-    );
-    like(
-        $results->{stdout},
-        qr/COMMAND:\nprintf hello\nOUTPUT:\nhello/,
-        "shell: basic output is captured and shown"
-    );
-    is($results->{exit_code}, 0, "shell: basic command exits cleanly");
-}
-
-=head3 Test ,shell command supports pipelines
-
-=cut
-
-{
-    my $results = run_synergy_session(
-        [",shell printf 'a\\nb\\n' | sed -n 2p\n", ",exit\n",]);
-
-    like(
-        $results->{stdout},
-        qr/COMMAND:\nprintf 'a\\nb\\n' \| sed -n 2p\nOUTPUT:\nb\n/,
-        "shell: pipeline syntax is preserved and executed"
-    );
-    is($results->{exit_code}, 0, "shell: pipeline exits cleanly");
-}
-
-=head3 Test ,shell command preserves redirects and stderr merging
-
-=cut
-
-{
-    my $merge_file = "$temp_dir/shell_redirect_capture.txt";
-    my $results    = run_synergy_session(
-        [
-            ",shell sh -c 'echo out; echo err 1>&2' > $merge_file 2>&1\n",
-            ",shell cat $merge_file\n", ",exit\n",
-        ]
-    );
-
-    like(
-        $results->{stdout},
-        qr/shell: cat \Q$merge_file\E/,
-        "shell: follow-up cat command executes"
-    );
-    like(
-        $results->{stdout},
-        qr/COMMAND:\ncat \Q$merge_file\E\nOUTPUT:\nout\nerr\n/,
-        "shell: redirects and stderr merge survive parsing"
-    );
-    is($results->{exit_code}, 0, "shell: redirect case exits cleanly");
-}
-
-=head3 Test ,shell command handles non-zero exit
-
-=cut
-
-{
-    my $results = run_synergy_session([",shell false\n", ",exit\n",]);
-
-    like(
-        $results->{stdout},
-        qr/WARNING: Command exited with status 1/,
-        "shell: non-zero exit is reported"
-    );
-    is($results->{exit_code}, 0, "shell: non-zero exit does not kill REPL");
-}
-
-=head3 Test ,shell command with no arguments
-
-=cut
-
-{
-    my $results = run_synergy_session([",shell\n", ",exit\n",]);
-
-    like(
-        $results->{stdout},
-        qr/ERROR: Usage: ,shell <cmd>/,
-        "shell: empty usage error is shown"
-    );
-    is($results->{exit_code}, 0, "shell: empty usage exits cleanly");
+    unlike($results->{stdout}, qr/^hello$/m,
+        "shell: removed command is not executed");
+    is($results->{exit_code}, 0, "shell: removed command exits cleanly");
 }
 
 =head3 Test ,exec command (command with no output)
@@ -1134,7 +1115,7 @@ they should work.
     );
     unlike(
         $results->{stdout},
-        qr/Allow this git command to run\? \[y\/N\]/,
+        qr/Allow this git command to run\?/,
         "exec git: no longer prompts for confirmation in user mode"
     );
     unlike(
@@ -1173,6 +1154,148 @@ they should work.
         "exec: rg output captured correctly");
 }
 
+=head3 Test ,push carries real UTF-8 into the request, not '?' scrub
+
+Regression for the encoding pipeline: pushed UTF-8 files used to be
+byte-scrubbed to '?' placeholders, so the model never saw the real
+content (and could only echo '?'s back into patches).
+
+=cut
+
+{
+    my $capture_dir = tempdir(CLEANUP => 1);
+    my $curl_dir    = tempdir(CLEANUP => 1);
+    write_fake_curl($curl_dir);
+
+    my $utf8_file = "$temp_dir/push_utf8_$$.txt";
+    open my $ufh, '>', $utf8_file or die "Cannot create $utf8_file: $!";
+    print {$ufh} "marker \xe2\x80\x9cquoted\xe2\x80\x9d \xe2\x97\x8f end\n";
+    close $ufh;
+
+    local $ENV{SYNERGY_CURL_CAPTURE_DIR} = $capture_dir;
+    local $ENV{PATH}                     = "$curl_dir:$ENV{PATH}";
+    local $ENV{OPENAI_API_KEY}           = "OPENAI_KEY_TEST";
+
+    my $results = run_synergy_session(
+        [",push $utf8_file\n", "utf8 push probe\n", ",exit\n"]);
+
+    is($results->{exit_code}, 0, "push utf8: exits cleanly");
+
+    my ($body_file) = glob("$capture_dir/req_*_body.json");
+    ok($body_file, "push utf8: captured request body");
+    my $body = decode_json(slurp($body_file));
+    my ($context_msg)
+      = grep { ($_->{content} // '') =~ /Relevant file\/context state/ }
+      @{$body->{input}};
+    ok($context_msg, "push utf8: context message present");
+    like(
+        $context_msg->{content},
+        qr/marker \x{201c}quoted\x{201d} \x{25cf} end/,
+        "push utf8: real characters reach the request"
+    );
+    unlike(
+        $context_msg->{content},
+        qr/marker \?+quoted/,
+        "push utf8: no '?' scrub in the request"
+    );
+}
+
+=head3 Test ,exec output keeps real UTF-8
+
+=cut
+
+{
+    my $utf8_file = "$temp_dir/exec_utf8_$$.txt";
+    open my $ufh, '>', $utf8_file or die "Cannot create $utf8_file: $!";
+    print {$ufh} "arrow \xe2\x94\x80\xe2\x96\xb6 done\n";
+    close $ufh;
+
+    my $results = run_synergy_session([",exec cat $utf8_file\n", ",exit\n"]);
+
+    like(
+        $results->{stdout},
+        qr/arrow \xe2\x94\x80\xe2\x96\xb6 done/,
+        "exec utf8: command output shows real characters"
+    );
+    unlike(
+        $results->{stdout},
+        qr/arrow \?+ done/,
+        "exec utf8: command output is not scrubbed to '?'"
+    );
+}
+
+=head3 Test ,push falls back to '?' scrub for non-UTF-8 (binary) files
+
+=cut
+
+{
+    my $binary_file = "$temp_dir/push_binary_$$.dat";
+    open my $bfh, '>', $binary_file or die "Cannot create $binary_file: $!";
+    print {$bfh} "head \xff\xfe\x01 tail\n";
+    close $bfh;
+
+    my $results
+      = run_synergy_session([",push $binary_file\n", ",peek 0\n", ",exit\n"]);
+
+    is($results->{exit_code}, 0, "push binary: exits cleanly");
+
+    # \xff and \xfe are scrubbed; \x01 is ASCII and passes through.
+    like(
+        $results->{stdout},
+        qr/head \?\?\x01 tail/,
+        "push binary: invalid UTF-8 falls back to '?' placeholders"
+    );
+    unlike($results->{stdout}, qr/\xff/,
+        "push binary: raw invalid bytes do not reach the terminal");
+}
+
+=head3 Test stale pushed-file detection: announce once, never rewrite
+
+A pushed text file is a snapshot; when the disk copy changes, both
+workers get a NOTE (once per on-disk version) telling them to
+,drop + ,push. The stack entry itself is never rewritten.
+
+=cut
+
+{
+    my $stale_file = "$temp_dir/stale_detect_$$.txt";
+    open my $sfh, '>', $stale_file or die "Cannot create $stale_file: $!";
+    print {$sfh} "original content line\n";
+    close $sfh;
+
+    my $results = run_synergy_session(
+        [
+            ",push $stale_file\n",
+            "first stale probe\n",
+            ",exec perl -i -pe 's/original/CHANGED/' $stale_file\n",
+            "second stale probe\n",
+            "third stale probe\n",
+            ",peek 0\n",
+            ",history\n",
+            ",exit\n",
+        ]
+    );
+
+    is($results->{exit_code}, 0, "stale detect: exits cleanly");
+
+    # Announced exactly once live, and once more when ,history
+    # replays the conversation entry; a third occurrence would mean
+    # the dedupe failed.
+    my @notes = $results->{stdout}
+      =~ /(NOTE: context entry \[0\] for '\Q$stale_file\E' is stale \(file changed on disk\))/g;
+    is(scalar @notes,
+        2, "stale detect: announced once live and recorded once in history");
+    like(
+        $results->{stdout},
+        qr/,drop 0 then ,push \Q$stale_file\E to refresh/,
+        "stale detect: note names the explicit refresh commands"
+    );
+    like(
+        $results->{stdout},
+        qr/contents: original content line/,
+        "stale detect: context entry is never rewritten behind the workers' backs"
+    );
+}
 
 done_testing();
 

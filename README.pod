@@ -21,7 +21,7 @@ If you go to the Terminal and start C<synergy>, a prompt appears. You can type q
 
 Synergy also accepts special commands starting with a comma. These commands are not sent to the AI assistant. Instead, they control the state of the REPL. For example, you can add a text file into the context of the current conversation, or serialize the current session to disk as an XML file.
 
-When you add a file to the context, it is stored in a stack. There are several stack manipulation commands for pushing, popping, rotating, etc.
+When you add a file to the context, it is stored in a stack. There are several stack manipulation commands for pushing, popping, and inspecting entries.
 
 =head3 Noninteractive mode (input via pipe)
 

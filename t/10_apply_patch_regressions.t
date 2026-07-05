@@ -161,7 +161,11 @@ sub run_apply_patch {
     );
 }
 
-=head3 Backup behavior: first write creates one original-content backup
+=head3 Backup behavior: edits do not create .bak litter
+
+The old per-session .bak backup feature was removed; edited files are
+covered by version control. Pin that repeated edits to the same file
+apply cleanly and leave no backup files behind.
 
 =cut
 
@@ -181,21 +185,11 @@ sub run_apply_patch {
         $SYNERGY,
     );
 
-    unlike(
-        $res->{stdout},
-        qr/apply_patch: backed up '\Q$file\E'/,
-        "apply_patch backup: does not report backup notice to REPL stdout"
-    );
+    is(slurp($file), "three\n", "apply_patch backup: both edits applied");
 
     my @backups = glob "$file.*.bak";
-    is(
-        scalar @backups,
-        1,
-        "apply_patch backup: only one backup is created per file per session"
-    );
-    is(slurp($backups[0]),
-        "one\n", "apply_patch backup: backup contains original content");
-    is(slurp($file), "three\n", "apply_patch backup: both edits applied");
+    is(scalar @backups,
+        0, "apply_patch backup: no .bak files are created for edited files");
 }
 
 =head3 Backup behavior: new-file patch does not create empty backup
@@ -368,6 +362,90 @@ EOF
     );
     is(slurp($file), "alpha\n",
         "agent apply_patch parser: space-containing path leaves file unchanged"
+    );
+}
+
+=head3 apply_patch must not re-encode untouched non-ASCII content
+
+Regression for the double-encoding bug: the file was read as raw
+bytes but written through utf8::all's :utf8 layer, so every
+non-ASCII byte in the file (even in untouched regions) was
+re-encoded as Latin-1-to-UTF-8 on every patch.
+
+=cut
+
+{
+    my $file = "$temp_dir/apply_patch_utf8_preserve_$$.txt";
+
+    # Real UTF-8 bytes: curly quotes, a bullet, a box-drawing arrow.
+    my $quote_line  = "a \xe2\x80\x9cquoted\xe2\x80\x9d phrase\n";
+    my $bullet_line = "\xe2\x97\x8f red \xe2\x94\x80\xe2\x96\xb6 cyan\n";
+    write_text($file, $quote_line . "ascii target\n" . $bullet_line);
+
+    my $res = run_apply_patch($file, "ascii target\n", "ascii replaced\n");
+
+    like(
+        $res->{stdout},
+        qr/apply_patch: Applied edits to file/,
+        "apply_patch utf8 preserve: edit applied"
+    );
+    is(
+        slurp($file),
+        $quote_line . "ascii replaced\n" . $bullet_line,
+        "apply_patch utf8 preserve: untouched non-ASCII bytes are byte-identical"
+    );
+    unlike(slurp($file), qr/\xc3\xa2\xc2/,
+        "apply_patch utf8 preserve: no double-encoding fingerprint");
+}
+
+=head3 apply_patch matches ORIGINAL text containing real UTF-8
+
+=cut
+
+{
+    my $file = "$temp_dir/apply_patch_utf8_match_$$.txt";
+    write_text($file,
+        "before\nsay \xe2\x80\x9chello\xe2\x80\x9d now\nafter\n");
+
+    my $res = run_apply_patch(
+        $file,
+        "say \xe2\x80\x9chello\xe2\x80\x9d now\n",
+        "say \xe2\x80\x9cgoodbye\xe2\x80\x9d now\n"
+    );
+
+    like(
+        $res->{stdout},
+        qr/apply_patch: Applied edits to file/,
+        "apply_patch utf8 match: unicode ORIGINAL matched"
+    );
+    is(
+        slurp($file),
+        "before\nsay \xe2\x80\x9cgoodbye\xe2\x80\x9d now\nafter\n",
+        "apply_patch utf8 match: replacement written as valid single-encoded UTF-8"
+    );
+}
+
+=head3 apply_patch leaves non-UTF-8 (binary) files byte-oriented
+
+=cut
+
+{
+    my $file = "$temp_dir/apply_patch_binary_$$.dat";
+
+    # \xff\xfe is not valid UTF-8 anywhere in a stream.
+    write_text($file, "\xff\xfe\x01 BINARY MARKER line\ntrailer\n");
+
+    my $res = run_apply_patch($file, "trailer\n", "patched trailer\n");
+
+    like(
+        $res->{stdout},
+        qr/apply_patch: Applied edits to file/,
+        "apply_patch binary: edit applied to non-UTF-8 file"
+    );
+    is(
+        slurp($file),
+        "\xff\xfe\x01 BINARY MARKER line\npatched trailer\n",
+        "apply_patch binary: invalid-UTF-8 bytes pass through untouched"
     );
 }
 

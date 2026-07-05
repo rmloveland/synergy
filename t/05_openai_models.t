@@ -82,6 +82,22 @@ if (OFFLINE_MODE) {
     is($results->{exit_code}, 0, "model: switches to gpt-5 exits cleanly");
 }
 
+=head3 Test ,model command (switch to Anthropic Fable model)
+
+=cut
+
+{
+    my $results
+      = run_synergy_session([",model claude-fable\n", ",model\n", ",exit\n"]);
+    like(
+        $results->{stdout},
+        qr/Switched model to 'claude-fable' \(`claude-fable-5`\).*Model: 'claude-fable'/s,
+        "model: switches to claude-fable and displays it correctly"
+    );
+    is($results->{exit_code}, 0,
+        "model: switches to claude-fable exits cleanly");
+}
+
 =head3 Test ,model command (switch to invalid model)
 
 =cut

@@ -21,26 +21,41 @@ package Synergy::Prompt;
 use strict;
 use warnings;
 
-sub build_prompt_context {
-    my (%args)       = @_;
-    my $convo_aref   = $args{convo}   // [];
-    my $context_aref = $args{context} // [];
-    my $sep          = $args{sep}     // "\n===\n";
+# Render the pushed file-context stack as one delimited user message,
+# marked for provider prompt caching. Sentinel lines rather than
+# markdown fences: pushed files routinely contain ``` themselves,
+# which would close a fence early and spill file content into the
+# surrounding message. The asymmetric BEGIN/END pair also makes a
+# truncated request obvious when reading captures and logs.
+#
+# Image entries (pushed as `image: '/path'` placeholders) are carried
+# as paths on the internal synergy_images tag; the provider builders
+# read and base64-encode them at request time. Like
+# synergy_cache_role, the tag must never be serialized into a body.
+sub _context_message {
+    my ($context_aref, $sep) = @_;
 
-    my ($block_start, $block_end);
-    $block_start = '```';
-    $block_end   = '```';
+    my (@text_entries, @image_paths);
+    for my $entry (@$context_aref) {
+        if   ($entry =~ /^image: '(.+)'\z/) { push @image_paths,  $1 }
+        else                                { push @text_entries, $entry }
+    }
 
-    my ($convo_content, $context_content);
-    $convo_content   = @$convo_aref   ? join($sep, @$convo_aref)   : '';
-    $context_content = @$context_aref ? join($sep, @$context_aref) : '';
+    my $context_content = join($sep, @text_entries);
+    my $message         = <<"EOCONTEXTMSG";
+Relevant file/context state:
+----- BEGIN FILE CONTEXT -----
+$context_content
+----- END FILE CONTEXT -----
+EOCONTEXTMSG
 
-    return {
-        convo_content   => $convo_content,
-        context_content => $context_content,
-        block_start     => $block_start,
-        block_end       => $block_end,
+    my $msg = {
+        role               => 'user',
+        content            => $message,
+        synergy_cache_role => 'context',
     };
+    $msg->{synergy_images} = \@image_paths if @image_paths;
+    return $msg;
 }
 
 sub _labeled_user_message {
@@ -70,118 +85,55 @@ sub convo_entry_to_message {
     return {role => 'user', content => $entry,};
 }
 
+# Append conversation history and mark the newest history message as
+# an incremental cache point. The live prompt after it changes every
+# turn, but this turn's history is next turn's byte-identical prefix,
+# so a breakpoint here lets provider caches grow with the conversation.
+sub _push_convo_messages {
+    my ($messages_aref, $convo_aref) = @_;
+
+    my $added = 0;
+    for my $entry (@$convo_aref) {
+        my $msg = convo_entry_to_message(entry => $entry,);
+        next unless $msg;
+        push @$messages_aref, $msg;
+        $added++;
+    }
+    $messages_aref->[-1]{synergy_cache_role} = 'history' if $added;
+    return;
+}
+
+# The one request builder for both chat and agent turns. The layout
+# [context, history..., final turn message] is deliberately identical
+# across modes: provider prompt caches are prefix matches, so any
+# mode-specific content must ride in the final message, after the
+# history cache breakpoint, or switching modes forks the cache and
+# re-ingests the whole session.
 sub build_request_messages {
     my (%args)       = @_;
     my $convo_aref   = $args{convo}        // [];
     my $context_aref = $args{context}      // [];
     my $sep          = $args{sep}          // "\n===\n";
     my $user_message = $args{user_message} // '';
+    my $user_label   = $args{user_label};
 
     my @messages;
 
-    for my $entry (@$convo_aref) {
-        my $msg = convo_entry_to_message(entry => $entry,);
-        push @messages, $msg if $msg;
-    }
-
+    # Stable content first: the pushed file context must precede the
+    # growing conversation history or its cache entry is invalidated
+    # on every turn.
     if (@$context_aref) {
-        my $ctx = build_prompt_context(
-            convo   => [],
-            context => $context_aref,
-            sep     => $sep,
-        );
-
-        my $context_message = <<"EOCONTEXTMSG";
-Relevant file/context state:
-$ctx->{block_start}
-$ctx->{context_content}
-$ctx->{block_end}
-EOCONTEXTMSG
-        push @messages,
-          {
-            role               => 'user',
-            content            => $context_message,
-            synergy_cache_role => 'context',
-          };
+        push @messages, _context_message($context_aref, $sep);
     }
 
-    push @messages, {role => 'user', content => $user_message,};
-
-    return \@messages;
-}
-
-sub build_agent_request_messages {
-    my (%args)           = @_;
-    my $convo_aref       = $args{convo}            // [];
-    my $context_aref     = $args{context}          // [];
-    my $sep              = $args{sep}              // "\n===\n";
-    my $task_description = $args{task_description} // '';
-    my $cwd              = $args{cwd}              // '.';
-    my $next_turn_prompt = $args{next_turn_prompt} // '';
-
-    my @messages;
-
-    my $environment_message = <<"EOENVMSG";
-Working Directory: $cwd
-
-Task:
-$task_description
-EOENVMSG
-    push @messages,
-      _labeled_user_message(
-        label   => 'Agent task and environment',
-        content => $environment_message,
-      );
-
-    if (@$context_aref) {
-        my $ctx = build_prompt_context(
-            convo   => [],
-            context => $context_aref,
-            sep     => $sep,
-        );
-
-        my $context_message = <<"EOCONTEXTMSG";
-Relevant file/context state:
-$ctx->{block_start}
-$ctx->{context_content}
-$ctx->{block_end}
-EOCONTEXTMSG
-        push @messages,
-          {
-            role               => 'user',
-            content            => $context_message,
-            synergy_cache_role => 'context',
-          };
-    }
-
-    for my $entry (@$convo_aref) {
-        my $msg = convo_entry_to_message(entry => $entry,);
-        push @messages, $msg if $msg;
-    }
+    _push_convo_messages(\@messages, $convo_aref);
 
     push @messages,
-      _labeled_user_message(
-        label   => 'Agent next turn',
-        content => $next_turn_prompt,
-      );
+      defined $user_label
+      ? _labeled_user_message(label => $user_label, content => $user_message)
+      : {role => 'user', content => $user_message,};
 
     return \@messages;
-}
-
-sub estimate_request_chars {
-    my (%args)        = @_;
-    my $messages      = $args{messages}      // [];
-    my $system_prompt = $args{system_prompt} // '';
-    my $chars         = length $system_prompt;
-
-    for my $msg (@$messages) {
-        next unless ref($msg) eq 'HASH';
-        $chars += length($msg->{role}    // '');
-        $chars += length($msg->{content} // '');
-        $chars += 16;
-    }
-
-    return $chars;
 }
 
 package Synergy::Provider;
@@ -190,45 +142,64 @@ use strict;
 use warnings;
 use Try::Tiny;
 use JSON::PP;
+use File::Slurp  qw(slurp);
+use MIME::Base64 qw(encode_base64);
 
+# Read and base64-encode the images tagged on a message via
+# synergy_images. Returns (\@images, \@unavailable): each image is
+# {mime, data}; unreadable paths land in @unavailable so the builder
+# can degrade to a text placeholder and the request still succeeds
+# (the dump-portability path: a loaded dump may name images that no
+# longer exist).
+sub _encoded_images {
+    my ($paths_aref) = @_;
+    my (@images, @unavailable);
+    for my $path (@{$paths_aref // []}) {
+        my $mime = Synergy::Util::image_mime_type($path);
+        my $bytes
+          = (defined $mime && -r $path) ? eval { slurp($path) } : undef;
+        if (!defined $bytes) {
+            warn qq[WARNING: image '$path' unreadable, sending placeholder\n];
+            push @unavailable, $path;
+            next;
+        }
+        push @images, {mime => $mime, data => encode_base64($bytes, '')};
+    }
+    return (\@images, \@unavailable);
+}
+
+sub _text_with_unavailable_images {
+    my ($content, $unavailable_aref) = @_;
+    return $content unless @{$unavailable_aref // []};
+    return join("\n",
+        $content, map {qq{[image '$_' unavailable]}} @$unavailable_aref);
+}
+
+# Parsers are pure: parse($body, $JSON) returns {content, usage,
+# thinking}; the caller records usage and thinking as it sees fit.
 sub provider_def {
-    my (%args)   = @_;
+    my (%args) = @_;
     my $provider = $args{provider};
-    my $JSON     = $args{JSON};
-
-    my $last_openai_cached_tokens_ref = $args{last_openai_cached_tokens_ref};
-    my $last_openai_prompt_tokens_ref = $args{last_openai_prompt_tokens_ref};
-    my $last_anthropic_thinking_ref   = $args{last_anthropic_thinking_ref};
-    my $session_token_usage_ref       = $args{session_token_usage_ref};
 
     my %defs = (
         openai => {
             build => \&build_openai_request,
-            parse => sub {
-                my ($body) = @_;
-                return parse_openai_response(
-                    $body, $JSON,
-                    $last_openai_prompt_tokens_ref,
-                    $last_openai_cached_tokens_ref,
-                    $session_token_usage_ref
-                );
-            },
+            parse => \&parse_openai_response,
         },
         anthropic => {
             build => \&build_anthropic_request,
-            parse => sub {
-                my ($body) = @_;
-                return parse_anthropic_response($body, $JSON,
-                    $last_anthropic_thinking_ref, $session_token_usage_ref);
-            },
+            parse => \&parse_anthropic_response,
         },
         gemini => {
             build => \&build_gemini_request,
-            parse => sub {
-                my ($body) = @_;
-                return parse_gemini_response($body, $JSON,
-                    $session_token_usage_ref);
-            },
+            parse => \&parse_gemini_response,
+        },
+
+        # Fireworks speaks the OpenAI chat-completions dialect; the
+        # OpenAI parser's 'choices' branch handles its responses.
+        fireworks => {
+            build => \&build_fireworks_request,
+            parse => \&parse_openai_response,
         },
     );
 
@@ -254,6 +225,28 @@ sub build_openai_request {
             next unless ref($msg) eq 'HASH';
             next unless defined $msg->{role};
             next unless defined $msg->{content};
+            if ($msg->{synergy_images}) {
+                my ($images, $unavailable)
+                  = _encoded_images($msg->{synergy_images});
+                my $text = _text_with_unavailable_images($msg->{content},
+                    $unavailable);
+                push @input, {
+                    role    => $msg->{role},
+                    content => [
+                        (
+                            map {
+                                {
+                                    type      => 'input_image',
+                                    image_url =>
+                                      qq[data:$_->{mime};base64,$_->{data}],
+                                }
+                            } @$images
+                        ),
+                        {type => 'input_text', text => $text},
+                    ],
+                };
+                next;
+            }
             push @input, {role => $msg->{role}, content => $msg->{content}};
         }
     }
@@ -295,7 +288,79 @@ sub build_openai_request {
     };
 }
 
-sub _accumulate_session_usage {
+sub build_fireworks_request {
+    my (%args)        = @_;
+    my $api_key       = $args{api_key};
+    my $model         = $args{model};
+    my $system_prompt = $args{system_prompt} // '';
+    my $user_message  = $args{user_message}  // '';
+    my $messages_aref = $args{messages};
+
+    my @messages;
+    if (length $system_prompt) {
+        push @messages, {role => 'system', content => $system_prompt};
+    }
+    if ($messages_aref && ref($messages_aref) eq 'ARRAY') {
+        for my $msg (@$messages_aref) {
+            next unless ref($msg) eq 'HASH';
+            next unless defined $msg->{role};
+            next unless defined $msg->{content};
+            if ($msg->{synergy_images}) {
+                my ($images, $unavailable)
+                  = _encoded_images($msg->{synergy_images});
+                my $text = _text_with_unavailable_images($msg->{content},
+                    $unavailable);
+                push @messages, {
+                    role    => $msg->{role},
+                    content => [
+                        (
+                            map {
+                                {
+                                    type      => 'image_url',
+                                    image_url => {
+                                        url =>
+                                          qq[data:$_->{mime};base64,$_->{data}]
+                                    },
+                                }
+                            } @$images
+                        ),
+                        {type => 'text', text => $text},
+                    ],
+                };
+                next;
+            }
+            push @messages,
+              {role => $msg->{role}, content => $msg->{content}};
+        }
+    }
+    else {
+        push @messages, {role => 'user', content => $user_message};
+    }
+
+    # Fireworks' default completion budget is small; give long agent
+    # replies room to finish.
+    my $max_tokens = 16384;
+    if (defined $ENV{SYNERGY_FIREWORKS_MAX_TOKENS}
+        && $ENV{SYNERGY_FIREWORKS_MAX_TOKENS} =~ /^\d+$/)
+    {
+        $max_tokens = int($ENV{SYNERGY_FIREWORKS_MAX_TOKENS});
+    }
+
+    return {
+        url     => 'https://api.fireworks.ai/inference/v1/chat/completions',
+        headers => [
+            'Content-Type: application/json',
+            'Authorization: Bearer ' . $api_key,
+        ],
+        body => {
+            model      => $model,
+            messages   => \@messages,
+            max_tokens => $max_tokens,
+        },
+    };
+}
+
+sub accumulate_session_usage {
     my ($session_token_usage_ref, $usage_href) = @_;
     return unless $session_token_usage_ref;
     return unless ref($session_token_usage_ref) eq 'HASH';
@@ -317,12 +382,7 @@ sub _accumulate_session_usage {
 }
 
 sub _extract_openai_content_and_usage {
-    my (
-        $data,
-        $last_openai_prompt_tokens_ref,
-        $last_openai_cached_tokens_ref,
-        $session_token_usage_ref
-    ) = @_;
+    my ($data) = @_;
 
     my $content;
 
@@ -357,9 +417,6 @@ sub _extract_openai_content_and_usage {
     {
         $content = $data->{choices}[0]{message}{content};
     }
-
-    $$last_openai_cached_tokens_ref = undef;
-    $$last_openai_prompt_tokens_ref = undef;
 
     my $input_tokens;
     my $output_tokens;
@@ -400,19 +457,17 @@ sub _extract_openai_content_and_usage {
         $cached_tokens = $data->{usage}{input_tokens_details}{cached_tokens};
     }
 
-    $$last_openai_prompt_tokens_ref = $input_tokens if defined $input_tokens;
-    $$last_openai_cached_tokens_ref = $cached_tokens
-      if defined $cached_tokens;
-
     my %usage;
     $usage{input_tokens}  = $input_tokens  if defined $input_tokens;
     $usage{output_tokens} = $output_tokens if defined $output_tokens;
     $usage{total_tokens}  = $total_tokens  if defined $total_tokens;
     $usage{cached_tokens} = $cached_tokens if defined $cached_tokens;
 
-    _accumulate_session_usage($session_token_usage_ref, \%usage);
+    # Total prompt size (OpenAI input counts include cached tokens);
+    # drives the automatic compaction check.
+    $usage{prompt_tokens} = $input_tokens if defined $input_tokens;
 
-    return $content;
+    return ($content, \%usage);
 }
 
 sub build_anthropic_request {
@@ -448,18 +503,43 @@ sub build_anthropic_request {
             next unless ref($msg) eq 'HASH';
             next unless defined $msg->{role};
             next unless defined $msg->{content};
-            if (($msg->{synergy_cache_role} // '') eq 'context') {
-                push @messages,
-                  {
-                    role    => $msg->{role},
-                    content => [
+
+            # Messages tagged by the prompt builder ('context' block,
+            # newest 'history' message) carry a cache breakpoint; the
+            # live prompt after them stays a plain uncached string.
+            # Image blocks precede the text block, so the breakpoint
+            # on the final (text) block covers them in the cached
+            # prefix.
+            if ($msg->{synergy_cache_role} || $msg->{synergy_images}) {
+                my (@blocks, $text);
+                $text = $msg->{content};
+                if ($msg->{synergy_images}) {
+                    my ($images, $unavailable)
+                      = _encoded_images($msg->{synergy_images});
+                    push @blocks, map {
                         {
-                            type          => 'text',
-                            text          => $msg->{content},
-                            cache_control => {%cache_control},
+                            type   => 'image',
+                            source => {
+                                type       => 'base64',
+                                media_type => $_->{mime},
+                                data       => $_->{data},
+                            },
                         }
-                    ],
+                    } @$images;
+                    $text
+                      = _text_with_unavailable_images($text, $unavailable);
+                }
+                push @blocks,
+                  {
+                    type => 'text',
+                    text => $text,
+                    (
+                        $msg->{synergy_cache_role}
+                        ? (cache_control => {%cache_control})
+                        : ()
+                    ),
                   };
+                push @messages, {role => $msg->{role}, content => \@blocks};
             }
             else {
                 push @messages,
@@ -518,6 +598,29 @@ sub build_gemini_request {
             next unless defined $msg->{content};
 
             my $gemini_role = $msg->{role} eq 'assistant' ? 'model' : 'user';
+            if ($msg->{synergy_images}) {
+                my ($images, $unavailable)
+                  = _encoded_images($msg->{synergy_images});
+                my $text = _text_with_unavailable_images($msg->{content},
+                    $unavailable);
+                push @contents, {
+                    role  => $gemini_role,
+                    parts => [
+                        (
+                            map {
+                                {
+                                    inline_data => {
+                                        mime_type => $_->{mime},
+                                        data      => $_->{data},
+                                    }
+                                }
+                            } @$images
+                        ),
+                        {text => $text},
+                    ],
+                };
+                next;
+            }
             push @contents,
               {role => $gemini_role, parts => [{text => $msg->{content}}],};
         }
@@ -545,36 +648,32 @@ sub build_gemini_request {
 }
 
 sub parse_openai_response {
-    my (
-        $body, $JSON,
-        $last_openai_prompt_tokens_ref,
-        $last_openai_cached_tokens_ref,
-        $session_token_usage_ref
-    ) = @_;
-    my $data    = decode_json_response($JSON, $body);
-    my $content = _extract_openai_content_and_usage(
-        $data,
-        $last_openai_prompt_tokens_ref,
-        $last_openai_cached_tokens_ref,
-        $session_token_usage_ref
-    );
+    my ($body, $JSON) = @_;
+    my $data = decode_json_response($JSON, $body);
+    my ($content, $usage) = _extract_openai_content_and_usage($data);
     die "OpenAI response missing content" unless defined $content;
-    return $content;
+    return {content => $content, usage => $usage};
 }
 
 sub parse_anthropic_response {
-    my ($body, $JSON, $last_anthropic_thinking_ref, $session_token_usage_ref)
-      = @_;
+    my ($body, $JSON) = @_;
     my $data = decode_json_response($JSON, $body);
     my @text_chunks;
     my @thinking_chunks;
 
-    $$last_anthropic_thinking_ref = undef
-      if defined $last_anthropic_thinking_ref;
-
+    my %usage_to_record;
     my $usage = $data->{usage};
     if ($usage && ref($usage) eq 'HASH') {
-        my $input_tokens  = $usage->{input_tokens};
+
+        # Anthropic's input_tokens is only the uncached remainder;
+        # add the cache read and write counts so 'input' means the
+        # full prompt, matching the other providers (and keeping the
+        # ,tokens cache-hit percentage bounded at 100%).
+        my $input_tokens = $usage->{input_tokens};
+        if (defined $input_tokens) {
+            $input_tokens += ($usage->{cache_read_input_tokens} // 0)
+              + ($usage->{cache_creation_input_tokens} // 0);
+        }
         my $output_tokens = $usage->{output_tokens};
         my $total_tokens
           = defined($input_tokens)
@@ -582,7 +681,6 @@ sub parse_anthropic_response {
           ? ($input_tokens + $output_tokens)
           : undef;
         my $cached_tokens = $usage->{cache_read_input_tokens};
-        my %usage_to_record;
 
         $usage_to_record{input_tokens} = $input_tokens
           if defined $input_tokens;
@@ -593,8 +691,9 @@ sub parse_anthropic_response {
         $usage_to_record{cached_tokens} = $cached_tokens
           if defined $cached_tokens;
 
-        _accumulate_session_usage($session_token_usage_ref,
-            \%usage_to_record);
+        # Total prompt size; drives the automatic compaction check.
+        $usage_to_record{prompt_tokens} = $input_tokens
+          if defined $input_tokens;
     }
 
     if (ref($data->{content}) eq 'ARRAY') {
@@ -637,25 +736,25 @@ sub parse_anthropic_response {
         $content = $data->{completion};
     }
 
-    if (@thinking_chunks && defined $last_anthropic_thinking_ref) {
-        $$last_anthropic_thinking_ref = join('', @thinking_chunks);
-    }
-
     die "Anthropic response missing content" unless defined $content;
-    return $content;
+    return {
+        content  => $content,
+        usage    => \%usage_to_record,
+        thinking => (@thinking_chunks ? join('', @thinking_chunks) : undef),
+    };
 }
 
 sub parse_gemini_response {
-    my ($body, $JSON, $session_token_usage_ref) = @_;
+    my ($body, $JSON) = @_;
     my $data = decode_json_response($JSON, $body);
 
+    my %usage_to_record;
     my $usage = $data->{usageMetadata};
     if ($usage && ref($usage) eq 'HASH') {
         my $input_tokens  = $usage->{promptTokenCount};
         my $output_tokens = $usage->{candidatesTokenCount};
         my $total_tokens  = $usage->{totalTokenCount};
         my $cached_tokens = $usage->{cachedContentTokenCount};
-        my %usage_to_record;
 
         $total_tokens = $input_tokens + $output_tokens
           if !defined($total_tokens)
@@ -671,13 +770,15 @@ sub parse_gemini_response {
         $usage_to_record{cached_tokens} = $cached_tokens
           if defined $cached_tokens;
 
-        _accumulate_session_usage($session_token_usage_ref,
-            \%usage_to_record);
+        # Total prompt size (promptTokenCount includes cached tokens);
+        # drives the automatic compaction check.
+        $usage_to_record{prompt_tokens} = $input_tokens
+          if defined $input_tokens;
     }
 
     my $content = $data->{candidates}[0]{content}{parts}[0]{text};
     die "Gemini response missing content" unless defined $content;
-    return $content;
+    return {content => $content, usage => \%usage_to_record};
 }
 
 sub decode_json_response {
@@ -702,6 +803,15 @@ use strict;
 use warnings;
 use File::Temp  qw(tempfile);
 use File::Slurp qw/ slurp /;
+use POSIX       qw(WNOHANG);
+use Time::HiRes ();
+
+# $in_flight is true while a curl child runs. The SIGINT handler sets
+# $cancel_requested instead of its usual behavior; the poll loop below
+# then kills curl and aborts the call with a 'canceled:' error, which
+# the retry machinery treats as final rather than retryable.
+our $in_flight        = 0;
+our $cancel_requested = 0;
 
 sub curl_request {
     my (%args)  = @_;
@@ -712,7 +822,9 @@ sub curl_request {
     my ($req_fh,  $req_file)  = tempfile('synergy_req_XXXX',  TMPDIR => 1);
     my ($err_fh,  $err_file)  = tempfile('synergy_err_XXXX',  TMPDIR => 1);
     my ($resp_fh, $resp_file) = tempfile('synergy_resp_XXXX', TMPDIR => 1);
+    my ($code_fh, $code_file) = tempfile('synergy_code_XXXX', TMPDIR => 1);
     close $resp_fh;
+    close $code_fh;
 
     print $req_fh $body;
     close $req_fh;
@@ -729,18 +841,47 @@ sub curl_request {
     }
     push @cmd, $url;
 
-    open my $curl_fh, '-|', @cmd or die "ERROR: failed to execute curl: $!";
-    binmode($curl_fh, ':raw');
-    my $http_code = do { local $/; <$curl_fh> };
-    close $curl_fh;
-    my $exit_code = $? >> 8;
+    local $in_flight = 1;
+    $cancel_requested = 0;
 
+    my $pid = fork();
+    die "ERROR: failed to fork for curl: $!" unless defined $pid;
+    if ($pid == 0) {
+        open STDOUT, '>', $code_file or die "redirect curl stdout: $!";
+        exec {$cmd[0]} @cmd or die "exec curl failed: $!";
+    }
+
+    # Poll instead of blocking so Ctrl-C can cancel the request and an
+    # interactive user sees a heartbeat instead of a frozen prompt.
+    my $interactive = (-t STDOUT && -t STDERR) ? 1 : 0;
+    my $started     = Time::HiRes::time();
+    my $last_beat   = 0;
+    my $beating     = 0;
+    while (waitpid($pid, WNOHANG) == 0) {
+        if ($cancel_requested) {
+            kill 'TERM', $pid;
+            waitpid($pid, 0);
+            print STDERR "\r\033[K" if $beating;
+            unlink $req_file, $resp_file, $err_file, $code_file;
+            die "canceled: request interrupted by user\n";
+        }
+
+        my $elapsed = int(Time::HiRes::time() - $started);
+        if ($interactive && $elapsed > $last_beat) {
+            $last_beat = $elapsed;
+            $beating   = 1;
+            printf STDERR "\r[waiting for response... %ds]", $elapsed;
+        }
+        Time::HiRes::sleep(0.1);
+    }
+    my $exit_code = $? >> 8;
+    print STDERR "\r\033[K" if $beating;
+
+    my $http_code = slurp($code_file);
     my $stderr    = slurp($err_file);
     my $resp_body = slurp($resp_file);
 
-    unlink $req_file;
-    unlink $resp_file if defined $resp_file;
-    unlink $err_file;
+    unlink $req_file, $resp_file, $err_file, $code_file;
 
     if ($exit_code != 0) {
         die qq[curl failed (exit $exit_code): $stderr];
@@ -763,12 +904,43 @@ package Synergy::Util;
 
 use strict;
 use warnings;
+use Encode     ();
 use File::Temp qw(tempfile);
 
 my $uuid_generator;
 
 BEGIN {
     eval { require Data::UUID; 1 } and $uuid_generator = Data::UUID->new();
+}
+
+# Decode bytes as strict UTF-8, or return undef so the caller can
+# fall back to byte-oriented handling for binary content. Note
+# Encode::decode with a check argument consumes its input; pass a
+# copy.
+sub decode_utf8_or_undef {
+    my ($bytes) = @_;
+    return undef unless defined $bytes;
+    return
+      scalar
+      eval { Encode::decode('UTF-8', my $copy = $bytes, Encode::FB_CROAK); };
+}
+
+my %IMAGE_MIME = (
+    jpg  => 'image/jpeg',
+    jpeg => 'image/jpeg',
+    png  => 'image/png',
+    gif  => 'image/gif',
+    webp => 'image/webp',
+);
+
+# Single authority for "is this path an image": returns the MIME
+# type for a known image extension, else undef.
+sub image_mime_type {
+    my ($path) = @_;
+    return undef unless defined $path;
+    my ($ext) = $path =~ /\.([A-Za-z0-9]+)\z/;
+    return undef unless defined $ext;
+    return $IMAGE_MIME{lc $ext};
 }
 
 sub generate_uuid {
@@ -914,10 +1086,8 @@ package Synergy::Patch;
 
 use strict;
 use warnings;
-use feature     qw/ say state /;
+use feature     qw/ say /;
 use File::Slurp qw/ slurp /;
-use File::Copy  qw/ copy /;
-use Try::Tiny;
 use File::Spec;
 use Cwd;
 
@@ -1408,7 +1578,20 @@ sub apply_patch {
         return;
     }
 
-    my $content = $file_exists ? slurp($canonical) : '';
+    # Read as UTF-8 characters so index/substr matching agrees with
+    # the model's patch text (already characters, decoded from the
+    # response JSON) and with the :utf8 write side below. A file that
+    # is not valid UTF-8 (binary) stays bytes and is written back
+    # through :raw — never re-encoded either way. Reading bytes here
+    # while writing through the utf8::all-layered handle was the bug
+    # that double-encoded every non-ASCII character in a patched file.
+    my ($content, $content_is_bytes) = ('', 0);
+    if ($file_exists) {
+        my $raw     = slurp($canonical);
+        my $decoded = Synergy::Util::decode_utf8_or_undef($raw);
+        if   (defined $decoded) { $content = $decoded }
+        else                    { $content = $raw; $content_is_bytes = 1 }
+    }
     my $applied = 0;
     for my $block (@blocks) {
         my $search  = _trim_ws($block->{search});
@@ -1454,19 +1637,8 @@ sub apply_patch {
         return;
     }
 
-    # One silent original-content backup per file per session.
-    state %backed_up;
-    if ($file_exists && !$backed_up{$canonical}) {
-        my $backup = $canonical . '.' . time() . '.bak';
-        unless (copy($canonical, $backup)) {
-            emit_err("ERROR: Could not back up file '$filename': $!",
-                $convo, $agent_mode);
-            return;
-        }
-        $backed_up{$canonical} = 1;
-    }
-
-    if (open my $out, '>', $canonical) {
+    my $out_mode = $content_is_bytes ? '>:raw' : '>:utf8';
+    if (open my $out, $out_mode, $canonical) {
         print {$out} $content;
         close $out;
     }
@@ -1501,50 +1673,72 @@ sub _parse_exec_error {
     return {error => $msg};
 }
 
-sub _validate_git_commit_message_quoting {
-    my (%args) = @_;
-    my $cmd    = $args{cmd}  // '';
-    my $argv   = $args{argv} // [];
+# Split a raw ,exec line into pipeline segments on unquoted '|'.
+# Other shell operators are rejected outright: a single command execs
+# with no shell, and a pipeline only ever gets the '|' we place
+# between policy-checked segments, so an unquoted ';', '&', '<', or
+# '>' would silently become a literal argument — an error is kinder
+# than a command that quietly does something else. Quoted operators
+# pass through as ordinary argument text.
+sub _split_pipeline {
+    my ($cmd) = @_;
 
-    return unless @$argv >= 2;
-    return unless $argv->[0] eq 'git' && $argv->[1] eq 'commit';
+    my @segments = ('');
+    my $len      = length $cmd;
+    my ($in_single, $in_double) = (0, 0);
 
-    if ($cmd =~ /(?:^|\s)(?:-m|--message)(?:\s+|=)(?!["'])\S+\s+([^-][^\s]*)/)
-    {
-        return
-          'ERROR: git commit message arguments must be quoted; use git commit -m "subject" -m "body" or git commit -F file';
-    }
+    my $i = 0;
+    while ($i < $len) {
+        my $c = substr($cmd, $i, 1);
 
-    return;
-}
+        if ($in_single) {
+            $in_single = 0 if $c eq q['];
+            $segments[-1] .= $c;
+            $i++;
+            next;
+        }
+        if ($in_double || $c eq '\\') {
+            if ($c eq '\\' && $i + 1 < $len) {
+                $segments[-1] .= substr($cmd, $i, 2);
+                $i += 2;
+                next;
+            }
+            $in_double = 0 if $in_double && $c eq q["];
+            $segments[-1] .= $c;
+            $i++;
+            next;
+        }
+        if ($c eq q[']) { $in_single = 1; }
+        if ($c eq q["]) { $in_double = 1; }
 
-sub _validate_search_pattern_quoting {
-    my (%args) = @_;
-    my $cmd    = $args{cmd}  // '';
-    my $argv   = $args{argv} // [];
+        if ($c eq '|') {
+            if (substr($cmd, $i + 1, 1) eq '|') {
+                return (undef,
+                    qq[ERROR: shell operator '||' is not supported in ,exec (only '|' pipelines)]
+                );
+            }
+            push @segments, '';
+            $i++;
+            next;
+        }
+        if ($c eq ';' || $c eq '&' || $c eq '<' || $c eq '>') {
+            return (undef,
+                qq[ERROR: shell operator '$c' is not supported in ,exec (only '|' pipelines)]
+            );
+        }
 
-    return if $cmd =~ /["']/;
-    return unless @$argv >= 5;
-
-    my $tool = basename($argv->[0] // '');
-    return unless $tool eq 'rg' || $tool eq 'grep';
-
-    my $i = 1;
-    while ($i < @$argv && ($argv->[$i] // '') =~ /^-/) {
+        $segments[-1] .= $c;
         $i++;
     }
 
-    return if $i >= $#$argv;
+    if (@segments > 1) {
+        for my $segment (@segments) {
+            return (undef, "ERROR: empty pipeline segment in ,exec command")
+              if $segment !~ /\S/;
+        }
+    }
 
-    my @remaining = @{$argv}[$i .. $#$argv];
-    return unless @remaining >= 5;
-
-    my $pattern = join(' ', @remaining[0 .. $#remaining - 1]);
-    return unless $pattern =~ /\s/;
-    return unless $pattern =~ /[:;,]/;
-
-    return
-      qq[ERROR: $tool search patterns containing spaces must be quoted; use quotes around the pattern, e.g. $tool -n "ERROR: No command provided" path];
+    return (\@segments, undef);
 }
 
 sub parse_exec_command {
@@ -1555,42 +1749,184 @@ sub parse_exec_command {
         return _parse_exec_error("ERROR: No command provided to ,exec");
     }
 
-    my @argv;
-    try {
-        @argv = shellwords($cmd);
-    }
-    catch {
-        return _parse_exec_error("ERROR: Failed to parse ,exec command: $_");
-    };
+    my ($segment_strings, $split_error) = _split_pipeline($cmd);
+    return _parse_exec_error($split_error) if defined $split_error;
 
-    unless (@argv) {
-        return _parse_exec_error("ERROR: No command provided to ,exec");
-    }
-
-    for my $a (@argv) {
-        if (!defined $a || $a =~ /\0/ || $a =~ /[\r\n]/) {
+    my @segments;
+    for my $segment_string (@$segment_strings) {
+        my @argv;
+        try {
+            @argv = shellwords($segment_string);
+        }
+        catch {
             return _parse_exec_error(
-                "ERROR: Invalid control characters in ,exec arguments");
+                "ERROR: Failed to parse ,exec command: $_");
+        };
+
+        unless (@argv) {
+            return _parse_exec_error("ERROR: No command provided to ,exec");
+        }
+
+        for my $a (@argv) {
+            if (!defined $a || $a =~ /\0/ || $a =~ /[\r\n]/) {
+                return _parse_exec_error(
+                    "ERROR: Invalid control characters in ,exec arguments");
+            }
+        }
+
+        push @segments,
+          {
+            argv            => \@argv,
+            raw_base_cmd    => $argv[0],
+            policy_base_cmd => basename($argv[0]),
+            full_cmd        => join(' ', @argv),
+          };
+    }
+
+    my $first = $segments[0];
+    return {
+        segments        => \@segments,
+        argv            => $first->{argv},
+        raw_base_cmd    => $first->{raw_base_cmd},
+        policy_base_cmd => $first->{policy_base_cmd},
+        full_cmd        => join(' | ', map { $_->{full_cmd} } @segments),
+    };
+}
+
+sub _git_subcommand_blocked_reason {
+    my ($argv_aref) = @_;
+    my ($subcmd, @tokens) = _git_subcommand_tokens($argv_aref);
+    return undef unless defined $subcmd;
+
+    my %always_blocked = map { $_ => 1 } qw(rebase);
+    return "git $subcmd is not permitted" if $always_blocked{$subcmd};
+
+    if ($subcmd eq 'push') {
+        return _git_push_blocked_reason(@tokens);
+    }
+
+    my %flagged = (reset => [qw(--hard)], commit => [qw(--amend)],);
+    if (my $blocked_flags = $flagged{$subcmd}) {
+        for my $flag (@$blocked_flags) {
+            if (grep { $_ eq $flag } @tokens) {
+                return "git $subcmd $flag is not permitted";
+            }
         }
     }
 
-    my $git_commit_msg_error
-      = _validate_git_commit_message_quoting(cmd => $cmd, argv => \@argv,);
-    return _parse_exec_error($git_commit_msg_error) if $git_commit_msg_error;
+    # git branch -D (force-delete); -d (merged-only) is fine
+    if ($subcmd eq 'branch' && grep { $_ eq '-D' } @tokens) {
+        return "git branch -D is not permitted";
+    }
 
-    my $search_pattern_error
-      = _validate_search_pattern_quoting(cmd => $cmd, argv => \@argv,);
-    return _parse_exec_error($search_pattern_error) if $search_pattern_error;
+    # git clean -f / -fd / -fx etc.
+    if ($subcmd eq 'clean' && grep {/^-[a-z]*f/i} @tokens) {
+        return "git clean -f is not permitted";
+    }
 
-    my $raw_base_cmd    = $argv[0];
-    my $policy_base_cmd = basename($raw_base_cmd);
+    return undef;
+}
 
-    return {
-        argv            => \@argv,
-        raw_base_cmd    => $raw_base_cmd,
-        policy_base_cmd => $policy_base_cmd,
-        full_cmd        => join(' ', @argv),
-    };
+sub _git_subcommand_tokens {
+    my ($argv_aref) = @_;
+    my @tokens = @{$argv_aref // []};
+    shift @tokens;    # remove 'git'
+
+    while (@tokens) {
+        my $t = shift @tokens;
+
+        if ($t eq '-C' || $t eq '-c') {
+            shift @tokens if @tokens;
+            next;
+        }
+
+        if ($t
+            =~ /^--(?:git-dir|work-tree|namespace|super-prefix|exec-path|config-env)$/
+          )
+        {
+            shift @tokens if @tokens;
+            next;
+        }
+
+        next
+          if $t
+          =~ /^--(?:git-dir|work-tree|namespace|super-prefix|exec-path|config-env)=/;
+
+        next if $t =~ /^-/;
+
+        return ($t, @tokens);
+    }
+
+    return;
+}
+
+sub _git_push_blocked_reason {
+    my (@tokens) = @_;
+
+    for my $t (@tokens) {
+        return "git push --force is not permitted"
+          if $t eq '--force' || $t eq '-f' || $t =~ /^-[^-]*f/;
+        return "git push --force-with-lease is not permitted"
+          if $t eq '--force-with-lease' || $t =~ /^--force-with-lease=/;
+        return "git push --delete is not permitted"
+          if $t eq '--delete' || $t eq '-d' || $t =~ /^-[^-]*d/;
+        return "git push --mirror is not permitted"       if $t eq '--mirror';
+        return "git push --prune is not permitted"        if $t eq '--prune';
+        return "git push force refspec is not permitted"  if $t =~ /^\+/;
+        return "git push delete refspec is not permitted" if $t =~ /^:/;
+    }
+
+    return undef;
+}
+
+# The blade guards: one command policy for every worker, human or
+# agent. 'deny' is enforced unconditionally; 'confirm' means the
+# agent must ask (a human typing the command is their own approval);
+# 'allow' runs without ceremony.
+sub exec_policy {
+    my (%args)   = @_;
+    my $base_cmd = $args{base_cmd} // '';
+    my $argv     = $args{argv}     // [];
+    $base_cmd = basename($base_cmd);
+
+    my @always_allowed_commands   = grep { $_ ne 'git' } allowed_commands();
+    my @confirm_required_commands = qw(git perl);
+    my @never_allowed_commands
+      = qw(rm sh bash zsh env python python3 ruby node);
+
+    return 'deny' if grep { $_ eq $base_cmd } @never_allowed_commands;
+
+    if ($base_cmd eq 'git') {
+        my $reason = _git_subcommand_blocked_reason($argv);
+        return ('deny', $reason) if defined $reason;
+        return 'confirm';
+    }
+
+    return 'confirm' if grep { $_ eq $base_cmd } @confirm_required_commands;
+    return 'allow'   if grep { $_ eq $base_cmd } @always_allowed_commands;
+    return 'confirm';
+}
+
+# Policy for a whole pipeline: the most restrictive segment wins.
+# Returns ('deny', $reason_or_undef, $denied_raw_base_cmd),
+# ('confirm'), or ('allow').
+sub pipeline_policy {
+    my (%args) = @_;
+    my $segments = $args{segments} // [];
+
+    my $needs_confirm = 0;
+    for my $segment (@$segments) {
+        my ($policy, $reason) = exec_policy(
+            base_cmd => $segment->{policy_base_cmd},
+            argv     => $segment->{argv},
+        );
+        if ($policy eq 'deny') {
+            return ('deny', $reason, $segment->{raw_base_cmd});
+        }
+        $needs_confirm = 1 if $policy eq 'confirm';
+    }
+
+    return ($needs_confirm ? 'confirm' : 'allow');
 }
 
 sub _shell_status_note {
@@ -1616,14 +1952,40 @@ sub _slurp_command_output {
     my ($temp_file) = @_;
     return ('', '') unless -f $temp_file;
 
-    my $t           = slurp($temp_file);
-    my $placeholder = '?';
-    $t =~ s/[^[:ascii:]]/$placeholder/g;
+    my $t       = slurp($temp_file);
+    my $decoded = Synergy::Util::decode_utf8_or_undef($t);
+    if (defined $decoded) {
+        $t = $decoded;
+    }
+    else {
+        # not valid UTF-8 (binary output): scrub to ASCII placeholders
+        $t =~ s/[^[:ascii:]]/?/g;
+    }
 
     my $command_output = $t;
     $command_output =~ s/\ACOMMAND:\n.*?\nOUTPUT:\n//s;
 
     return ($t, $command_output);
+}
+
+# Cap the command output that is stored in conversation history (and
+# echoed to the REPL). Oversized output becomes a head and tail around
+# an elision marker; the full output stays in the temp file, which an
+# agent can re-read in slices when it needs the middle. Uncapped tool
+# output is the main driver of context growth in agent sessions.
+sub _capped_command_output {
+    my ($command_output, $temp_file) = @_;
+
+    my $cap = $ENV{SYNERGY_EXEC_OUTPUT_CAP};
+    $cap = 20_000 unless defined($cap) && $cap =~ /^\d+$/;
+    return $command_output if !$cap || length($command_output) <= $cap;
+
+    my $half   = int($cap / 2);
+    my $elided = length($command_output) - 2 * $half;
+    return
+        substr($command_output, 0, $half)
+      . "\n[... $elided bytes elided; full output in '$temp_file' ...]\n"
+      . substr($command_output, -$half);
 }
 
 sub _agent_exec_summary {
@@ -1665,91 +2027,77 @@ sub _agent_exec_summary {
     return;
 }
 
-sub run_exec {
-    my (%args)         = @_;
-    my $cmd            = $args{cmd};
-    my $convo_aref     = $args{convo_aref} // [];
-    my $agent_mode     = $args{agent_mode};
-    my $logfile        = $args{logfile};
-    my $skip_allowlist = $args{skip_allowlist};
-
-    my $output;
-
-    my $parsed = parse_exec_command(cmd => $cmd) or return;
-    if ($parsed->{error}) {
-        say $parsed->{error};
-        push @$convo_aref, $parsed->{error} if $agent_mode;
-        return;
-    }
-    my @argv     = @{$parsed->{argv}};
-    my $base_cmd = shift @argv;
-
-    my @allowed_commands = allowed_commands();
-    unless ($skip_allowlist || grep { $_ eq $base_cmd } @allowed_commands) {
-        say "ERROR: Command '$base_cmd' not allowed in ,exec mode";
-        say "Allowed commands: " . join(", ", @allowed_commands);
-        return;
-    }
+# Runner for ,exec: capture the command's combined stdout/stderr in
+# a temp file, annotate exit status, and route the result to the
+# conversation, the log, and the REPL/agent output. `isolate` closes
+# stdin and neutralizes pager/editor environment variables in the
+# child.
+sub _run_captured {
+    my (%args)     = @_;
+    my $label      = $args{label};
+    my $display    = $args{display_cmd};
+    my $argv       = $args{argv};
+    my $isolate    = $args{isolate};
+    my $convo_aref = $args{convo_aref} // [];
+    my $agent_mode = $args{agent_mode};
+    my $logfile    = $args{logfile};
 
     my $temp_file
-      = "/tmp/synergy_exec_pid_$$" . "_timestamp_" . time() . ".txt";
+      = "/tmp/synergy_${label}_pid_$$" . "_timestamp_" . time() . ".txt";
 
-    my $full_cmd = $parsed->{full_cmd};
-    $output = "exec: $full_cmd";
+    my $output = "$label: $display";
     say $output unless $agent_mode;
 
     if (open my $tfh, '>', $temp_file) {
-        print $tfh "COMMAND:\n$full_cmd\nOUTPUT:\n";
+        print $tfh "COMMAND:\n$display\nOUTPUT:\n";
         close $tfh;
+
+        my $pid = fork();
+        if (!defined $pid) {
+            say "ERROR: Failed to fork for ,$label: $!";
+            $output .= "\nWARNING: Command exited with status -1";
+        }
+        elsif ($pid == 0) {
+            if ($isolate) {
+                open my $in, '<',  '/dev/null' or die "open /dev/null: $!";
+                open STDIN,  '<&', $in         or die "dup stdin: $!";
+                $ENV{'PAGER'}               = 'cat';
+                $ENV{'GIT_PAGER'}           = 'cat';
+                $ENV{'GIT_TERMINAL_PROMPT'} = '0';
+                $ENV{'GIT_EDITOR'}          = 'true';
+                $ENV{'EDITOR'}              = 'true';
+                $ENV{'VISUAL'}              = 'true';
+            }
+            open my $out, '>>', $temp_file or die "open temp_file: $!";
+            open STDOUT,  '>&', $out       or die "dup stdout: $!";
+            open STDERR,  '>&', $out       or die "dup stderr: $!";
+            exec {$argv->[0]} @$argv or die "exec failed: $!";
+        }
+        else {
+            waitpid($pid, 0);
+            _shell_status_note(\$output, $?);
+
+            if (!-e $temp_file) {
+                $output .= "\nERROR: Output file was not created";
+            }
+            elsif (!-s $temp_file) {
+                $output
+                  .= "\nINFO: Command executed successfully but produced no output"
+                  unless $output =~ /\nWARNING:/;
+            }
+        }
     }
     else {
-        say "ERROR: Failed to write exec output file: $!";
+        say "ERROR: Failed to write $label output file: $!";
         $output .= "\nERROR: Output file was not created";
-        goto THE_END;
     }
 
-    my $pid = fork();
-    if (!defined $pid) {
-        say "ERROR: Failed to fork for ,exec: $!";
-        $output .= "\nWARNING: Command exited with status -1";
-        goto THE_END;
-    }
-
-    if ($pid == 0) {
-        open my $in, '<',  '/dev/null' or die "open /dev/null: $!";
-        open STDIN,  '<&', $in         or die "dup stdin: $!";
-        $ENV{'PAGER'}               = 'cat';
-        $ENV{'GIT_PAGER'}           = 'cat';
-        $ENV{'GIT_TERMINAL_PROMPT'} = '0';
-        $ENV{'GIT_EDITOR'}          = 'true';
-        $ENV{'EDITOR'}              = 'true';
-        $ENV{'VISUAL'}              = 'true';
-        open my $out, '>>', $temp_file or die "open temp_file: $!";
-        open STDOUT,  '>&', $out       or die "dup stdout: $!";
-        open STDERR,  '>&', $out       or die "dup stderr: $!";
-        exec {$base_cmd} ($base_cmd, @argv) or die "exec failed: $!";
-    }
-
-    waitpid($pid, 0);
-    my $exit_code = $?;
-    _shell_status_note(\$output, $exit_code);
-
-    unless (-e $temp_file) {
-        $output .= "\nERROR: Output file was not created";
-        goto THE_END;
-    }
-
-    unless (-s $temp_file) {
-        $output
-          .= "\nINFO: Command executed successfully but produced no output"
-          unless $output =~ /\nWARNING:/;
-        goto THE_END;
-    }
-
-  THE_END:
     my ($t, $command_output) = _slurp_command_output($temp_file);
     if (-f $temp_file) {
-        say "exec: output saved to '$temp_file'" unless $agent_mode;
+        say "$label: output saved to '$temp_file'" unless $agent_mode;
+        my $stored = _capped_command_output($command_output, $temp_file);
+        $t = "COMMAND:\n$display\nOUTPUT:\n$stored"
+          if $stored ne $command_output;
         $output .= qq[\n$t];
     }
 
@@ -1759,8 +2107,8 @@ sub run_exec {
 
     if ($agent_mode) {
         _agent_exec_summary(
-            prefix         => 'exec',
-            full_cmd       => $full_cmd,
+            prefix         => $label,
+            full_cmd       => $display,
             output         => $output,
             command_output => $command_output,
             temp_file      => $temp_file,
@@ -1772,103 +2120,67 @@ sub run_exec {
     return;
 }
 
-sub run_shell {
-    my (%args)     = @_;
-    my $cmd        = $args{cmd};
-    my $convo_aref = $args{convo_aref} // [];
-    my $agent_mode = $args{agent_mode};
-    my $logfile    = $args{logfile};
+sub _shell_quote {
+    my ($word) = @_;
+    $word //= '';
+    $word =~ s/'/'\\''/g;
+    return qq['$word'];
+}
 
-    unless (defined $cmd && $cmd =~ /\S/) {
-        my $msg = "ERROR: Usage: ,shell <cmd>";
-        say $msg;
-        push @$convo_aref, $msg if $agent_mode;
-        Synergy::Util::append_to_log($logfile, $msg)
-          if defined $logfile && length $logfile;
+# A single command execs directly with no shell. A pipeline runs via
+# /bin/sh -c, which is safe here because every word is single-quote
+# escaped and the only shell operator in the string is the '|' we
+# place between policy-checked segments.
+sub _pipeline_argv {
+    my ($segments) = @_;
+    return $segments->[0]{argv} if @$segments == 1;
+
+    my $pipeline = join ' | ', map {
+        join ' ',
+          map { _shell_quote($_) }
+          @{$_->{argv}}
+    } @$segments;
+    return ['/bin/sh', '-c', $pipeline];
+}
+
+sub run_exec {
+    my (%args)      = @_;
+    my $cmd         = $args{cmd};
+    my $convo_aref  = $args{convo_aref} // [];
+    my $agent_mode  = $args{agent_mode};
+    my $skip_policy = $args{skip_policy};
+
+    my $parsed = parse_exec_command(cmd => $cmd) or return;
+    if ($parsed->{error}) {
+        say $parsed->{error};
+        push @$convo_aref, $parsed->{error} if $agent_mode;
         return;
     }
 
-    for my $a ($cmd) {
-        if (!defined $a || $a =~ /\0/ || $a =~ /[\r\n]/) {
-            my $msg = "ERROR: Invalid control characters in ,shell arguments";
-            say $msg;
-            push @$convo_aref, $msg if $agent_mode;
-            Synergy::Util::append_to_log($logfile, $msg)
-              if defined $logfile && length $logfile;
+    unless ($skip_policy) {
+        my ($policy, $deny_reason, $denied_cmd)
+          = pipeline_policy(segments => $parsed->{segments});
+        if ($policy eq 'deny') {
+            say 'ERROR: '
+              . ($deny_reason
+                  // "Command '$denied_cmd' is not permitted in ,exec");
             return;
         }
+
+        # 'confirm' needs no prompt here: on the human path, typing
+        # the command is the approval. The agent path prompts before
+        # running the handler and passes skip_policy.
     }
 
-    my $temp_file
-      = "/tmp/synergy_shell_pid_$$" . "_timestamp_" . time() . ".txt";
-
-    my $output = "shell: $cmd";
-    say $output unless $agent_mode;
-
-    if (open my $tfh, '>', $temp_file) {
-        print $tfh "COMMAND:\n$cmd\nOUTPUT:\n";
-        close $tfh;
-    }
-    else {
-        say "ERROR: Failed to write shell output file: $!";
-        $output .= "\nERROR: Output file was not created";
-        goto SHELL_END;
-    }
-
-    my $pid = fork();
-    if (!defined $pid) {
-        say "ERROR: Failed to fork for ,shell: $!";
-        $output .= "\nWARNING: Command exited with status -1";
-        goto SHELL_END;
-    }
-
-    if ($pid == 0) {
-        open my $out, '>>', $temp_file or die "open temp_file: $!";
-        open STDOUT,  '>&', $out       or die "dup stdout: $!";
-        open STDERR,  '>&', $out       or die "dup stderr: $!";
-        exec {'/bin/sh'} ('/bin/sh', '-lc', $cmd) or die "exec failed: $!";
-    }
-
-    waitpid($pid, 0);
-    my $exit_code = $?;
-    _shell_status_note(\$output, $exit_code);
-
-    unless (-e $temp_file) {
-        $output .= "\nERROR: Output file was not created";
-        goto SHELL_END;
-    }
-
-    unless (-s $temp_file) {
-        $output
-          .= "\nINFO: Command executed successfully but produced no output"
-          unless $output =~ /\nWARNING:/;
-        goto SHELL_END;
-    }
-
-  SHELL_END:
-    my ($t, $command_output) = _slurp_command_output($temp_file);
-    if (-f $temp_file) {
-        say "shell: output saved to '$temp_file'" unless $agent_mode;
-        $output .= qq[\n$t];
-    }
-
-    push @$convo_aref, $output;
-    Synergy::Util::append_to_log($logfile, $output)
-      if defined $logfile && length $logfile;
-
-    if ($agent_mode) {
-        _agent_exec_summary(
-            prefix         => 'shell',
-            full_cmd       => $cmd,
-            output         => $output,
-            command_output => $command_output,
-            temp_file      => $temp_file,
-        );
-    }
-    else {
-        print qq[$output];
-    }
-    return;
+    return _run_captured(
+        label       => 'exec',
+        display_cmd => $parsed->{full_cmd},
+        argv        => _pipeline_argv($parsed->{segments}),
+        isolate     => 1,
+        convo_aref  => $convo_aref,
+        agent_mode  => $agent_mode,
+        logfile     => $args{logfile},
+    );
 }
 
 package Synergy::SessionStore;
@@ -1879,6 +2191,16 @@ use feature      qw/ say /;
 use File::Slurp  qw/ slurp /;
 use MIME::Base64 qw(encode_base64 decode_base64);
 use Encode       qw(encode);
+
+# Dumps are written as base64 over UTF-8 bytes (see dump_session);
+# decode back to characters on load, falling back to raw bytes for
+# legacy dumps whose payload is not valid UTF-8.
+sub _dump_elem_text {
+    my ($encoded) = @_;
+    my $bytes     = decode_base64($encoded);
+    my $decoded   = Synergy::Util::decode_utf8_or_undef($bytes);
+    return defined $decoded ? $decoded : $bytes;
+}
 use Mojo::DOM;
 use Try::Tiny;
 use Time::HiRes qw/ time /;
@@ -1889,6 +2211,7 @@ sub dump_session {
     my $filename         = $args{filename};
     my $dump_dir         = $args{dump_dir};
     my $session_id       = $args{session_id};
+    my $model            = $args{model};
     my $system_prompt    = $args{system_prompt};
     my $convo_aref       = $args{convo}       // [];
     my $context_aref     = $args{context}     // [];
@@ -1907,7 +2230,9 @@ sub dump_session {
     }
 
     my $timestamp = time;
-    my $xml       = qq[<dump time="$timestamp" session="$session_id">\n];
+    my $model_attr
+      = defined $model && length $model ? qq[ model="$model"] : '';
+    my $xml = qq[<dump time="$timestamp" session="$session_id"$model_attr>\n];
 
     my $encoded_prompt = encode_base64(encode("UTF-8", $system_prompt));
     $xml
@@ -1992,10 +2317,8 @@ sub load_session {
             );
         }
         say "ERROR: Please provide a valid filename for the load: $!";
-        return (
-            $session_id,   $system_prompt, $convo_aref,
-            $context_aref, $active_dump_file
-        );
+        return ($session_id, $system_prompt, $convo_aref, $context_aref,
+            $active_dump_file, undef);
     }
 
     my $xml_content;
@@ -2005,10 +2328,8 @@ sub load_session {
     }
     catch {
         say "ERROR: Could not read '$filename': $_";
-        return (
-            $session_id,   $system_prompt, $convo_aref,
-            $context_aref, $active_dump_file
-        );
+        return ($session_id, $system_prompt, $convo_aref, $context_aref,
+            $active_dump_file, undef);
     };
 
     my $dom = Mojo::DOM->new($xml_content);
@@ -2023,6 +2344,11 @@ sub load_session {
           "WARNING: No session ID found in '$filename', keeping current session ID.";
     }
 
+    # Model the dump was made with (absent in older dumps); the caller
+    # switches to it so a reloaded session keeps its warm prompt cache.
+    my $dump_model = $dom->at('dump')->attr('model');
+    printf "%-35s%s\n", "Loading model", "... ok" if defined $dump_model;
+
     # Load system prompt with base64 decoding
     my $prompt_node = $dom->find('prompt')->first;
     if ($prompt_node) {
@@ -2030,7 +2356,7 @@ sub load_session {
         if (   $prompt_node->attr('encoding')
             && $prompt_node->attr('encoding') eq 'base64')
         {
-            $system_prompt = decode_base64($encoded_prompt);
+            $system_prompt = _dump_elem_text($encoded_prompt);
         }
         else {
             # Handle legacy files without encoding
@@ -2051,7 +2377,7 @@ sub load_session {
             if (   $elem->attr('encoding')
                 && $elem->attr('encoding') eq 'base64')
             {
-                push @$convo_aref, decode_base64($text);
+                push @$convo_aref, _dump_elem_text($text);
             }
             else {
                 # Handle legacy files without encoding
@@ -2075,7 +2401,7 @@ sub load_session {
             if (   $elem->attr('encoding')
                 && $elem->attr('encoding') eq 'base64')
             {
-                push @$context_aref, decode_base64($text);
+                push @$context_aref, _dump_elem_text($text);
             }
             else {
                 # Handle legacy files without encoding
@@ -2113,10 +2439,8 @@ sub load_session {
         $active_dump_file = $filename;
     }
 
-    return (
-        $session_id,   $system_prompt, $convo_aref,
-        $context_aref, $active_dump_file
-    );
+    return ($session_id, $system_prompt, $convo_aref, $context_aref,
+        $active_dump_file, $dump_model);
 }
 
 package Synergy::ContextStack;
@@ -2125,6 +2449,94 @@ use strict;
 use warnings;
 use feature     qw/ say /;
 use File::Slurp qw/ slurp /;
+
+# How a file's bytes become context text: decoded UTF-8 characters,
+# or ASCII-scrubbed bytes for binary content. Shared by push_path
+# and the staleness check so comparisons see the same transform.
+sub _file_context_text {
+    my ($path)  = @_;
+    my $t       = slurp($path);
+    my $decoded = Synergy::Util::decode_utf8_or_undef($t);
+    return $decoded if defined $decoded;
+    $t =~ s/[^[:ascii:]]/?/g;
+    return $t;
+}
+
+# Announce (once per on-disk version) any pushed file whose context
+# snapshot no longer matches the file, so either worker can refresh
+# it explicitly with ,drop N + ,push. Detection only, by design:
+# the stack is jointly owned, so it is never rewritten -- and the
+# cache prefix never invalidated -- behind the workers' backs.
+my %stale_announced;
+
+sub announce_stale_context {
+    my (%args)       = @_;
+    my $context_aref = $args{context_aref} // [];
+    my $convo_aref   = $args{convo_aref}   // [];
+
+    for my $i (0 .. $#$context_aref) {
+        my ($path, $stored)
+          = $context_aref->[$i] =~ /\Afile: '(.+)'\ncontents: (.*)\z/s
+          or next;
+
+        my ($key, $msg);
+        if (!-f $path) {
+            $key = qq[$i:$path:gone];
+            $msg
+              = qq[NOTE: context entry [$i] for '$path' is stale (file no longer exists); ,drop $i to remove it];
+        }
+        else {
+            my $mtime = (stat $path)[9] // 0;
+            $key = qq[$i:$path:$mtime];
+            next if $stale_announced{$key};
+            my $current = eval { _file_context_text($path) };
+            next unless defined $current;
+            next if $current eq $stored;
+            $msg
+              = qq[NOTE: context entry [$i] for '$path' is stale (file changed on disk); ,drop $i then ,push $path to refresh];
+        }
+        next if $stale_announced{$key};
+        $stale_announced{$key} = 1;
+        say $msg;
+        push @$convo_aref, $msg;
+    }
+    return;
+}
+
+# Announce files whose `git status --short` line changed since the
+# previous turn, so both workers see edits made outside the REPL
+# (editor saves, regenerated artifacts, branch switches). Pushed
+# files are covered separately by the staleness check above. A cwd
+# change just resets the snapshot rather than announcing a flood.
+my ($delta_cwd, $delta_status);
+
+sub announce_git_delta {
+    my (%args)     = @_;
+    my $convo_aref = $args{convo_aref} // [];
+    my $cwd        = Cwd::getcwd();
+    my $current    = qx{git status --short 2>/dev/null} // '';
+    if (   defined $delta_status
+        && $delta_cwd eq $cwd
+        && $current ne $delta_status)
+    {
+        my %prev = map { $_ => 1 } split /\n/, $delta_status;
+        my %curr = map { $_ => 1 } split /\n/, $current;
+        my %changed;
+        for my $line (keys %curr, keys %prev) {
+            next if $prev{$line} && $curr{$line};
+            my ($path) = $line =~ /^.{2} (.*)\z/ or next;
+            $changed{$path} = 1;
+        }
+        if (my @files = sort keys %changed) {
+            my $msg
+              = 'NOTE: changed since your last turn: ' . join(', ', @files);
+            say $msg;
+            push @$convo_aref, $msg;
+        }
+    }
+    ($delta_cwd, $delta_status) = ($cwd, $current);
+    return;
+}
 
 sub push_path {
     my (%args)             = @_;
@@ -2151,13 +2563,32 @@ sub push_path {
         closedir $dh;
         $output = qq[ directory: '$file_or_directory'\n contents: @listing];
     }
+    elsif (-f $file_or_directory
+        && Synergy::Util::image_mime_type($file_or_directory))
+    {
+        # Store a placeholder; the provider builders read and
+        # base64-encode the file at request time. Guard against
+        # payloads the providers would reject (Anthropic's limit is
+        # 5 MB decoded per image; base64 inflates by 4/3).
+        my $max_bytes = 4_000_000;
+        if (defined $ENV{SYNERGY_MAX_IMAGE_BYTES}
+            && $ENV{SYNERGY_MAX_IMAGE_BYTES} =~ /^\d+$/)
+        {
+            $max_bytes = int($ENV{SYNERGY_MAX_IMAGE_BYTES});
+        }
+        my $size = -s $file_or_directory;
+        if ($max_bytes && $size > $max_bytes) {
+            delete $already_in_context->{$file_or_directory};
+            my $msg
+              = qq[ERROR: image '$file_or_directory' is $size bytes, over the $max_bytes-byte limit (SYNERGY_MAX_IMAGE_BYTES raises it; 0 disables)];
+            say $msg;
+            push @$convo_aref, $msg if $agent_mode;
+            return;
+        }
+        $output = qq[image: '$file_or_directory'];
+    }
     elsif (-f $file_or_directory) {
-        my $t;
-        $t = slurp($file_or_directory);
-
-        # regex to remove all non-ASCII characters
-        my $placeholder = '?';
-        $t =~ s/[^[:ascii:]]/$placeholder/g;
+        my $t = _file_context_text($file_or_directory);
         $output = qq[file: '$file_or_directory'\ncontents: $t];
     }
     else {
@@ -2223,50 +2654,6 @@ sub drop_indices {
         push @$convo_aref, qq[drop: $output_str];
         say $output_str;
     }
-    return;
-}
-
-sub swap_top {
-    my (%args)       = @_;
-    my $context_aref = $args{context_aref};
-    my $convo_aref   = $args{convo_aref};
-
-    my $output;
-    if (scalar @$context_aref >= 2) {
-        (
-            $context_aref->[$#$context_aref - 1],
-            $context_aref->[$#$context_aref]
-          )
-          = (
-            $context_aref->[$#$context_aref],
-            $context_aref->[$#$context_aref - 1]
-          );
-        $output = qq{Swapped top two elements on the stack.};
-        push @$convo_aref, qq[swap: $output];
-    }
-    else {
-        $output = qq{Stack has less than two elements, cannot swap.};
-    }
-    say $output;
-    return;
-}
-
-sub rot {
-    my (%args)       = @_;
-    my $context_aref = $args{context_aref};
-    my $convo_aref   = $args{convo_aref};
-
-    my $output;
-    my $last = pop @$context_aref;
-    if ($last) {
-        unshift @$context_aref, $last;
-        $output = qq{Rotated context stack. Top element moved to bottom.};
-        push @$convo_aref, qq[rot: $output];
-    }
-    else {
-        $output = qq{Context stack is empty, nothing to rotate.};
-    }
-    say $output;
     return;
 }
 
@@ -2407,10 +2794,9 @@ sub run_agent_loop {
         already_in_context_href => $already_in_context_href,
     );
 
-    # Add the user's `,agent <task>` command to the visible history, but
-    # omit this synthetic history entry from agent API requests below.
-    # The task is already sent in the dedicated task/environment message.
-    my $agent_task_history_index = scalar @$convo_aref;
+    # Record the user's `,agent <task>` command in the history. It
+    # stays in agent requests too: history must remain byte-identical
+    # across chat and agent modes so both share one cache prefix.
     push @$convo_aref, qq[agent: $task_description];
 
     $$agent_mode_ref = 1;
@@ -2418,21 +2804,37 @@ sub run_agent_loop {
 
     while ($$agent_mode_ref) {
 
-        # Keep only static agent instructions in the system prompt.
-        # Dynamic state such as task, environment, context, and
-        # conversation history is sent as structured messages.
+        main::maybe_autocompact();
+        Synergy::ContextStack::announce_stale_context(
+            context_aref => $context_aref,
+            convo_aref   => $convo_aref,
+        );
+        Synergy::ContextStack::announce_git_delta(convo_aref => $convo_aref,);
 
-        my $dynamic_agent_system_prompt_content
-          = $$base_system_prompt_ref . <<"EOAGENTPROMPT";
+        # All agent-specific instructions ride in the final turn
+        # message, after the history cache breakpoint. The system
+        # prompt and the message prefix stay byte-identical with chat
+        # mode, so entering agent mode extends the session's server-
+        # side prompt cache instead of forking it; the re-sent tail
+        # costs ~1k tokens per turn, far less than re-ingesting the
+        # whole prefix on every mode switch.
+
+        my ($success, $command) = main::call_assistant_with_retries(
+            max_retries => $$max_retries_ref,
+            log_prefix  => 'AGENT: ',
+            attempt     => sub {
+                my $agent_turn_prompt = <<"EOAGENTTURN";
 MODE: AGENT
 
 **OPERATIONAL GUIDELINES for SYNERGY Agent Mode:**
 
-- DO read the AGENTS.md file in the currrent project, if one exists
+- The project's AGENTS.md file, if one exists, is already included in the file/context state; do not spend a command re-reading it.
 - DO use the defined commands to explore local files that you need to complete your task
 - DO use the `,apply_patch` command to write and edit files
-- DO use only single-shot `,exec` commands. No pipes, shell wrappers, wildcards, or redirection.
+- DO emit one `,exec` command per line; a command may be a `|` pipeline. No shell wrappers, wildcards, redirection, `;`, or `&&`.
 - DO review the outputs of the previously run commands, they're in the conversation history.
+- If a command is denied by the user or by policy, do not retry it or variations of it; choose a different approach or record the blocker with ,comment.
+- If you are blocked on information or a decision only the user can provide, use ,ask <question>; the loop pauses for their answer and then continues. Do not guess.
 
 ---
 **AVAILABLE COMMANDS:**
@@ -2441,30 +2843,21 @@ MODE: AGENT
         line_prefix    => '                        ',
     ) ]}
 @{[ join "\n", map { "                        $_" } Synergy::Util::agent_apply_patch_prompt_details() ]}
-- ,exec <cmd>       (Run a single shell command. Trusted commands run directly; git and unknown commands require user approval; destructive git operations, rm, and shell interpreters are blocked), e.g.,
+- ,exec <cmd>       (Run a command or a '|' pipeline. Trusted commands run directly; git and unknown commands require user approval; destructive git operations, rm, and shell interpreters are blocked), e.g.,
                         - ,exec rg -n <pattern> <file.txt>
+                        - ,exec rg -n <pattern> <file.txt> | head -20
                         - ,exec sed -n 100,120p <file.txt>
                         - ,exec ls
                         - ,exec git status --short
                         - ,exec jira-create-issue DOC "document the foo"
+- ,ask <question>   (pause; the user is asked and their answer is added to the conversation)
 - ,comment <text>   (record important context, blockers, or completion)
-EOAGENTPROMPT
 
-        my $retry_count = 0;
-        my $success     = 0;
-        my $command;
+Working Directory: $$cwd_ref
 
-        while (!$success && $retry_count <= $$max_retries_ref) {
-            try {
-                if ($retry_count > 0) {
-                    my $delay = main::BASE_DELAY() * (2**($retry_count - 1));
-                    say STDERR
-                      qq[AGENT: Retry attempt $retry_count after $delay second(s)...]
-                      unless -p STDIN;
-                    sleep $delay;
-                }
+Task:
+$task_description
 
-                my $agent_next_turn_prompt = <<"EOTURN";
 Decide the next useful agent action.
 
 Rules for your response:
@@ -2478,31 +2871,20 @@ Rules for your response:
 - If the task is complete, emit any needed user-visible final answer or report as bare prose, then finish with ,comment AGENT_COMPLETE.
 - AGENT_COMPLETE is a private control marker and will not be printed; do not put a user-facing summary after it.
 - Do not recap progress that is already visible unless the user explicitly asked for a summary, review, or report.
+EOAGENTTURN
 
-Choose the command line or command lines that move the task forward now.
-EOTURN
-                my @request_convo = @$convo_aref;
-                if (   $agent_task_history_index < @request_convo
-                    && defined $request_convo[$agent_task_history_index]
-                    && $request_convo[$agent_task_history_index] eq
-                    qq[agent: $task_description])
-                {
-                    splice @request_convo, $agent_task_history_index, 1;
-                }
-
-                my $messages = Synergy::Prompt::build_agent_request_messages(
-                    convo            => \@request_convo,
-                    context          => $context_aref,
-                    sep              => $$conv_sep_ref,
-                    task_description => $task_description,
-                    cwd              => $$cwd_ref,
-                    next_turn_prompt => $agent_next_turn_prompt,
+                my $messages = Synergy::Prompt::build_request_messages(
+                    convo        => $convo_aref,
+                    context      => $context_aref,
+                    sep          => $$conv_sep_ref,
+                    user_message => $agent_turn_prompt,
+                    user_label   => 'Agent next turn',
                 );
-                $command = $call_assistant_cb->(
+                my $reply = $call_assistant_cb->(
                     provider         => $$provider_ref,
                     api_key          => $$api_key_ref,
                     model            => $$model_config_ref->{model_name},
-                    system_prompt    => $dynamic_agent_system_prompt_content,
+                    system_prompt    => $$base_system_prompt_ref,
                     messages         => $messages,
                     reasoning_effort => 'high',
                     anthropic_thinking_enabled => (
@@ -2511,25 +2893,23 @@ EOTURN
                         : 0
                     ),
                 );
-                $success = 1;
                 $$api_calls_ref++;
-            }
-            catch {
-                my $error = $_;
-                $retry_count++;
+                return $reply;
+            },
+        );
+        unless ($success) {
+            if (($command // '') =~ /^canceled:/) {
 
-                if ($retry_count <= $$max_retries_ref) {
-                    say STDERR
-                      qq[AGENT: API call failed: $error - retrying ($retry_count/$$max_retries_ref)]
-                      unless -p STDIN;
-                }
-                else {
-                    $command
-                      = qq[AGENT_COMPLETE: API call failed after $$max_retries_ref retries: $error];
-                    say STDERR qq[$command] unless -p STDIN;
-                    $$agent_mode_ref = undef;
-                }
-            };
+                # The SIGINT handler already left agent mode; a quiet
+                # AGENT_COMPLETE ends the loop without a retry storm.
+                $command = qq[AGENT_COMPLETE: request canceled by user];
+            }
+            else {
+                $command
+                  = qq[AGENT_COMPLETE: API call failed after $$max_retries_ref retries: $command];
+                say STDERR qq[$command] unless -p STDIN;
+                $$agent_mode_ref = undef;
+            }
         }
 
         if ($command) {
@@ -2592,6 +2972,7 @@ sub _agent_action_summary {
 
     return if !defined $name  || $name eq 'comment';
     return if $name eq 'exec' || $name eq 'apply_patch';
+    return if $name eq 'ask';    # handler prints 'agent asks:' itself
 
     return length $raw ? qq[agent: $name $raw] : qq[agent: $name];
 }
@@ -2611,116 +2992,10 @@ sub _agent_log_info {
     return;
 }
 
-sub _git_subcommand_blocked_reason {
-    my ($argv_aref) = @_;
-    my ($subcmd, @tokens) = _git_subcommand_tokens($argv_aref);
-    return undef unless defined $subcmd;
-
-    my %always_blocked = map { $_ => 1 } qw(rebase);
-    return "git $subcmd is not permitted" if $always_blocked{$subcmd};
-
-    if ($subcmd eq 'push') {
-        return _git_push_blocked_reason(@tokens);
-    }
-
-    my %flagged = (reset => [qw(--hard)], commit => [qw(--amend)],);
-    if (my $blocked_flags = $flagged{$subcmd}) {
-        for my $flag (@$blocked_flags) {
-            if (grep { $_ eq $flag } @tokens) {
-                return "git $subcmd $flag is not permitted";
-            }
-        }
-    }
-
-    # git branch -D (force-delete); -d (merged-only) is fine
-    if ($subcmd eq 'branch' && grep { $_ eq '-D' } @tokens) {
-        return "git branch -D is not permitted";
-    }
-
-    # git clean -f / -fd / -fx etc.
-    if ($subcmd eq 'clean' && grep {/^-[a-z]*f/i} @tokens) {
-        return "git clean -f is not permitted";
-    }
-
-    return undef;
-}
-
-sub _git_subcommand_tokens {
-    my ($argv_aref) = @_;
-    my @tokens = @{$argv_aref // []};
-    shift @tokens;    # remove 'git'
-
-    while (@tokens) {
-        my $t = shift @tokens;
-
-        if ($t eq '-C' || $t eq '-c') {
-            shift @tokens if @tokens;
-            next;
-        }
-
-        if ($t
-            =~ /^--(?:git-dir|work-tree|namespace|super-prefix|exec-path|config-env)$/
-          )
-        {
-            shift @tokens if @tokens;
-            next;
-        }
-
-        next
-          if $t
-          =~ /^--(?:git-dir|work-tree|namespace|super-prefix|exec-path|config-env)=/;
-
-        next if $t =~ /^-/;
-
-        return ($t, @tokens);
-    }
-
-    return;
-}
-
-sub _git_push_blocked_reason {
-    my (@tokens) = @_;
-
-    for my $t (@tokens) {
-        return "git push --force is not permitted"
-          if $t eq '--force' || $t eq '-f' || $t =~ /^-[^-]*f/;
-        return "git push --force-with-lease is not permitted"
-          if $t eq '--force-with-lease' || $t =~ /^--force-with-lease=/;
-        return "git push --delete is not permitted"
-          if $t eq '--delete' || $t eq '-d' || $t =~ /^-[^-]*d/;
-        return "git push --mirror is not permitted"       if $t eq '--mirror';
-        return "git push --prune is not permitted"        if $t eq '--prune';
-        return "git push force refspec is not permitted"  if $t =~ /^\+/;
-        return "git push delete refspec is not permitted" if $t =~ /^:/;
-    }
-
-    return undef;
-}
-
-sub _agent_exec_policy {
-    my (%args)   = @_;
-    my $base_cmd = $args{base_cmd} // '';
-    my $argv     = $args{argv}     // [];
-    $base_cmd = basename($base_cmd);
-
-    my @always_allowed_commands
-      = grep { $_ ne 'git' } Synergy::Exec::allowed_commands();
-    my @confirm_required_commands = qw(git perl);
-    my @never_allowed_commands
-      = qw(rm sh bash zsh env python python3 ruby node);
-
-    return 'deny' if grep { $_ eq $base_cmd } @never_allowed_commands;
-
-    if ($base_cmd eq 'git') {
-        my $reason = _git_subcommand_blocked_reason($argv);
-        return ('deny', $reason) if defined $reason;
-        return 'confirm';
-    }
-
-    return 'confirm' if grep { $_ eq $base_cmd } @confirm_required_commands;
-    return 'allow'   if grep { $_ eq $base_cmd } @always_allowed_commands;
-    return 'confirm';
-}
+# Exact ,exec command lines the user answered 'a' (always) to at the
+# approval prompt. In-memory only: never dumped, so a reloaded
+# session starts with no standing approvals.
+my %agent_session_approved_execs;
 
 sub _agent_approve_exec {
     my (%args)     = @_;
@@ -2732,8 +3007,8 @@ sub _agent_approve_exec {
     my $request_label = $base_cmd eq 'git' ? 'git' : 'command';
     my $prompt
       = $base_cmd eq 'git'
-      ? "Allow this git command to run? [y/N] "
-      : "Allow this command to run? [y/N] ";
+      ? "Allow this git command to run? [y/N/a] "
+      : "Allow this command to run? [y/N/a] ";
 
     say qq[agent requests $request_label: $cmd];
     my $answer   = main::prompted_read_line($prompt);
@@ -2744,6 +3019,11 @@ sub _agent_approve_exec {
         $answer =~ s/\s+$//;
         my $normalized = lc $answer;
         $approved = 1 if $normalized eq 'y' || $normalized eq 'yes';
+        if ($normalized eq 'a' || $normalized eq 'always') {
+            $approved = 1;
+            $agent_session_approved_execs{$cmd} = 1;
+            say qq[Approved for the rest of this session: $cmd];
+        }
     }
 
     unless ($approved) {
@@ -2812,16 +3092,15 @@ sub execute_agent_command {
             }
             next unless $parsed;
 
-            my ($policy, $deny_reason) = _agent_exec_policy(
-                base_cmd => $parsed->{policy_base_cmd},
-                argv     => $parsed->{argv},
-            );
+            my ($policy, $deny_reason, $denied_cmd)
+              = Synergy::Exec::pipeline_policy(
+                segments => $parsed->{segments});
 
             if ($policy eq 'deny') {
                 my $msg
                   = defined $deny_reason
                   ? "AGENT INFO: $deny_reason"
-                  : "AGENT INFO: command denied by policy: $parsed->{raw_base_cmd}";
+                  : "AGENT INFO: command denied by policy: $denied_cmd";
                 _agent_log_info(
                     msg        => $msg,
                     convo_aref => $convo_aref,
@@ -2836,6 +3115,10 @@ sub execute_agent_command {
                 {
                     # yolo mode: skip the info line, user doesn't need it
                 }
+                elsif ($agent_session_approved_execs{$parsed->{full_cmd}}) {
+
+                    # user answered 'a' to this exact command earlier
+                }
                 else {
                     next
                       unless _agent_approve_exec(
@@ -2847,7 +3130,7 @@ sub execute_agent_command {
                 }
             }
 
-            $cmd_lookup->{$cmd_name}->($cmd_args, skip_allowlist => 1);
+            $cmd_lookup->{$cmd_name}->($cmd_args, skip_policy => 1);
             next;
         }
 
@@ -3070,24 +3353,10 @@ sub run_collect {
     my $conv_sep          = $args{conv_sep} // "\n===\n";
     my $logfile           = $args{logfile};
     my $call_assistant_cb = $args{call_assistant_cb};
-    my $keep_last_turns   = $args{keep_last_turns} // 0;
-    my $silent            = $args{silent} ? 1 : 0;
-    my $label             = $args{label} // 'collect';
 
     unless (@$convo_aref) {
-        say "$label: nothing to collect" unless $silent;
+        say "collect: nothing to collect";
         return;
-    }
-
-    my $source_convo_aref = $convo_aref;
-    my @recent_convo;
-    if ($keep_last_turns > 0) {
-        return unless @$convo_aref > $keep_last_turns;
-
-        my $split_idx = @$convo_aref - $keep_last_turns;
-        my @older     = @$convo_aref[0 .. ($split_idx - 1)];
-        @recent_convo      = @$convo_aref[$split_idx .. $#$convo_aref];
-        $source_convo_aref = \@older;
     }
 
     my $system_prompt
@@ -3098,41 +3367,72 @@ Please compact the current conversation history and any relevant file/context st
 Return only the handoff summary text.
 EOF
 
-    my $messages = Synergy::Prompt::build_request_messages(
-        convo        => $source_convo_aref,
-        context      => $context_aref,
-        sep          => $conv_sep,
-        user_message => $collect_user_message,
-    );
-
-    try {
-        my $summary = $call_assistant_cb->(
-            provider                   => $provider,
-            api_key                    => $api_key,
-            model                      => $model,
-            system_prompt              => $system_prompt,
-            messages                   => $messages,
-            reasoning_effort           => 'low',
-            user_message               => $collect_user_message,
-            anthropic_thinking_enabled => 0,
+    # The condition that triggers a compaction can also break it: the
+    # summarization call itself may exceed the context window. On
+    # failure, retry with the oldest quarter of the history dropped
+    # from the compaction input only; the live history is untouched
+    # until a summary is in hand.
+    my @source = @$convo_aref;
+    my $summary;
+    my $attempts = 0;
+    while (1) {
+        my $messages = Synergy::Prompt::build_request_messages(
+            convo        => \@source,
+            context      => $context_aref,
+            sep          => $conv_sep,
+            user_message => $collect_user_message,
         );
 
-        $summary = '' unless defined $summary;
-        $summary =~ s/\A\s+//;
-        $summary =~ s/\s+\z//;
+        my $ok = eval {
+            $summary = $call_assistant_cb->(
+                provider                   => $provider,
+                api_key                    => $api_key,
+                model                      => $model,
+                system_prompt              => $system_prompt,
+                messages                   => $messages,
+                reasoning_effort           => 'low',
+                user_message               => $collect_user_message,
+                anthropic_thinking_enabled => 0,
+            );
+            1;
+        };
+        last if $ok;
 
-        @$convo_aref = (qq[COLLECTED CONTEXT:\n$summary], @recent_convo);
-        Synergy::Util::append_to_log($logfile,
-            qq[$label: conversation history compacted into a handoff summary])
-          if defined $logfile && length $logfile;
-
-        say "$label: conversation history compacted into a handoff summary"
-          unless $silent;
+        chomp(my $error = $@ || 'unknown error');
+        $attempts++;
+        if ($error =~ /^canceled:/ || $attempts >= 3 || @source <= 1) {
+            say "ERROR: ,collect failed: $error";
+            return;
+        }
+        my $drop = int(@source / 4) || 1;
+        splice(@source, 0, $drop);
+        say "collect: retrying with the oldest $drop history"
+          . " entries dropped";
     }
-    catch {
-        chomp(my $error = $_);
-        say "ERROR: ,$label failed: $error";
-    };
+
+    $summary = '' unless defined $summary;
+    $summary =~ s/\A\s+//;
+    $summary =~ s/\s+\z//;
+
+    # Keep the user's own recent words verbatim alongside the summary;
+    # assistant replies and command output are left to the summary.
+    # Prior summaries lack the 'USER > ' prefix, so they are never
+    # re-harvested here.
+    my @retained;
+    my $budget = 16_000;
+    for my $entry (reverse @$convo_aref) {
+        next unless ($entry // '') =~ /^USER > /;
+        last if length($entry) > $budget;
+        push @retained, $entry;
+        $budget -= length($entry);
+    }
+
+    @$convo_aref = (qq[COLLECTED CONTEXT:\n$summary], reverse @retained);
+    my $note
+      = "collect: conversation history compacted into a" . " handoff summary";
+    Synergy::Util::append_to_log($logfile, $note)
+      if defined $logfile && length $logfile;
+    say $note;
 
     return;
 }
@@ -3326,18 +3626,6 @@ sub build_cmd_lookup {
                 indices_aref => \@indices,
             );
         },
-        swap => sub {
-            Synergy::ContextStack::swap_top(
-                context_aref => $S->{context_aref},
-                convo_aref   => $S->{convo_aref},
-            );
-        },
-        rot => sub {
-            Synergy::ContextStack::rot(
-                context_aref => $S->{context_aref},
-                convo_aref   => $S->{convo_aref},
-            );
-        },
         s => sub {
             Synergy::ContextStack::list_stack(
                 context_aref => $S->{context_aref});
@@ -3449,6 +3737,7 @@ sub build_cmd_lookup {
                 filename         => $filename,
                 dump_dir         => ${$S->{dump_dir_ref}},
                 session_id       => ${$S->{session_id_ref}},
+                model            => ${$S->{model_short_name_ref}},
                 system_prompt    => ${$S->{system_prompt_ref}},
                 convo            => $S->{convo_aref},
                 context          => $S->{context_aref},
@@ -3470,7 +3759,7 @@ sub build_cmd_lookup {
 
             my $active_dump_file = $$active_dump_file_ref;
             my ($session_id, $system_prompt, undef, undef,
-                $new_active_dump_file)
+                $new_active_dump_file, $dump_model)
               = Synergy::SessionStore::load_session(
                 filename         => $filename,
                 auto_dump_mode   => $$auto_dump_mode_ref,
@@ -3486,6 +3775,27 @@ sub build_cmd_lookup {
             $$system_prompt_ref    = $system_prompt;
             $$active_dump_file_ref = $new_active_dump_file;
             $$logfile_ref = qq[$$log_dir_ref/chats-$$session_id_ref.txt];
+
+            # Switch back to the model the dump was made with, so the
+            # reloaded session lines up with its server-side prompt
+            # cache. The user can still ,model away afterward.
+            my $current_short_name = ${$S->{model_short_name_ref}};
+            return
+              if !defined($dump_model) || $dump_model eq $current_short_name;
+            my ($found)
+              = grep { $_->{short_name} eq $dump_model } @$models_aref;
+            if ($found) {
+                ${$S->{model_config_ref}}     = $found;
+                ${$S->{model_short_name_ref}} = $found->{short_name};
+                ${$S->{provider_ref}}         = $found->{provider};
+                ${$S->{api_key_ref}}          = $ENV{$found->{env_var}};
+                say
+                  qq[Switched model to '$found->{short_name}' (`$found->{model_name}`).];
+            }
+            else {
+                say
+                  qq[WARNING: Dump was made with unknown model '$dump_model'; keeping '$current_short_name'.];
+            }
         },
         exec => sub {
             my ($cmd, %opts) = @_;
@@ -3497,25 +3807,33 @@ sub build_cmd_lookup {
                 %opts,
             );
         },
-        shell => sub {
-            my ($cmd) = @_;
+        ask => sub {
+            my ($question) = @_;
             my $logfile_ref = $S->{logfile_ref};
 
-            if (${$S->{agent_mode_ref}}) {
-                my $msg = "ERROR: ,shell is not available in agent mode";
-                say $msg;
-                push @{$S->{convo_aref}}, $msg;
-                Synergy::Util::append_to_log($$logfile_ref, $msg)
-                  if defined $$logfile_ref && length $$logfile_ref;
+            unless (${$S->{agent_mode_ref}}) {
+                say
+                  q[ERROR: ,ask pauses an agent for the user's answer; outside agent mode just type your question];
                 return;
             }
 
-            Synergy::Exec::run_shell(
-                cmd        => $cmd,
-                convo_aref => $S->{convo_aref},
-                agent_mode => ${$S->{agent_mode_ref}},
-                logfile    => $$logfile_ref,
-            );
+            my $entry;
+            if (!defined $question || $question !~ /\S/) {
+                $entry = q[AGENT ERROR: ,ask requires a question];
+                say $entry;
+            }
+            else {
+                say qq[agent asks: $question];
+                my $answer = main::prompted_read_line(q[your reply: ]);
+                $answer = '' unless defined $answer;
+                chomp $answer;
+                $answer =~ s/^\s+|\s+$//g;
+                $entry = qq[AGENT QUESTION: $question\nUSER ANSWER: ]
+                  . ($answer =~ /\S/ ? $answer : q[(none given)]);
+            }
+            push @{$S->{convo_aref}}, $entry;
+            Synergy::Util::append_to_log($$logfile_ref, $entry)
+              if defined $$logfile_ref && length $$logfile_ref;
         },
         comment => sub {
             my ($comment) = @_;
@@ -3574,6 +3892,12 @@ if ($^O eq 'MSWin32') {
     STDOUT->autoflush(1);
 }
 
+# utf8::all wraps STDERR in an encoding layer, which silently makes it
+# line-buffered on a tty. The HTTP heartbeat writes partial lines to
+# STDERR; without autoflush they sit in the buffer and flush after the
+# next readline prompt is drawn, erasing it.
+STDERR->autoflush(1);
+
 my $start = time;
 
 my $session_id = Synergy::Util::generate_uuid();
@@ -3587,6 +3911,10 @@ my $user_shell_prompt = qq[> ];
 my $CONV_SEP          = qq[\n===\n];
 my $last_openai_cached_tokens;
 my $last_openai_prompt_tokens;
+
+# Server-reported total prompt size of the most recent assistant call;
+# the automatic compaction check compares it to the model's window.
+my $last_prompt_tokens;
 my $session_token_usage = {
     input_tokens  => 0,
     output_tokens => 0,
@@ -3653,8 +3981,8 @@ History Management:
 File Context:
 ,s					Print contents of file context stack
 ,push file.txt		Push file.txt onto file context stack (B C - A B C)
-,swap				Swap top two elements of file context stack (A B - B A)
-,rot				Rotate file context stack entries (A B C - B C A)
+                     - Images (jpg/png/gif/webp) are sent to vision models
+                       as image attachments, re-read at request time
 ,drop [N...]		Remove elements of file context stack:
                      - With no args: pop top stack element (A B C - B C)
                      - With arg N: remove element at index N (A B .. N - A B ..)
@@ -3669,17 +3997,21 @@ System Interaction:
 ,pwd				Print current working directory
 ,cd /some/dir		Change working directory to /some/dir
 ,edit file.txt		Open file.txt in \$EDITOR
-,exec cmd			Execute shell command (rg sed wc ls file find cat make head nl prove git)
+,exec cmd			Execute a command, or a '|' pipeline of commands
+                    Blocked for everyone: rm, shell interpreters, and
+                    destructive git operations (push --force, reset --hard, ...)
+                    Other shell operators (;, &, <, >) are not supported
                     Output is saved to conversation history
-,shell cmd         Execute an arbitrary shell command via /bin/sh -lc
-                    (human-only; unavailable in agent mode)
 
 Agent Interaction:
 ,agent <prompt>		Prompt the system to complete a task autonomously using this command set.
-						Agent has access to: ,exec ,apply_patch ,comment
-						In agent mode, trusted single-shot commands run directly;
-						other commands require approval; destructive git operations,
-						rm, and shell wrappers are blocked.
+						Agent has access to: ,exec ,apply_patch ,comment ,ask
+						(,ask pauses the loop to ask you a question; your answer
+						is recorded in the conversation and the agent continues)
+						In agent mode, trusted commands run directly; git and
+						unknown commands prompt for approval [y/N/a] ('a' allows
+						that exact command for the rest of the session);
+						destructive git operations, rm, and shell wrappers are blocked.
 						Agent rings the bell when completed. Enter Ctrl-C to exit loop.
 $interactive_agent_apply_patch_help
 ,comment			Write a comment that is printed back to the REPL's output.
@@ -3694,6 +4026,8 @@ EOF
 my $base_system_prompt = <<"EOPROMPT";
 You are SYNERGY, a concise technical collaborator.
 
+Today's date: @{[ POSIX::strftime('%Y-%m-%d', localtime) ]}
+
 Priorities:
 - Answer the user's actual request directly.
 - Be correct, concrete, and practical.
@@ -3707,67 +4041,65 @@ Priorities:
 - State uncertainty briefly and specifically when needed.
 EOPROMPT
 
+# context_window is the model's maximum input tokens; it drives the
+# automatic compaction threshold. Models without one never compact.
 my @MODELS = (
     {
-        provider   => 'openai',
-        model_name => 'gpt-5.5-2026-04-23',
-        env_var    => 'OPENAI_API_KEY',
-        short_name => 'gpt-5',
+        provider       => 'openai',
+        model_name     => 'gpt-5.5-2026-04-23',
+        env_var        => 'OPENAI_API_KEY',
+        short_name     => 'gpt-5',
+        context_window => 400_000,
     },
     {
-        provider   => 'openai',
-        model_name => 'gpt-5.4-2026-03-05',
-        env_var    => 'OPENAI_API_KEY',
-        short_name => 'gpt-5.4',
+        provider       => 'openai',
+        model_name     => 'gpt-5.4-2026-03-05',
+        env_var        => 'OPENAI_API_KEY',
+        short_name     => 'gpt-5.4',
+        context_window => 400_000,
     },
     {
-        provider   => 'gemini',
-        model_name => 'gemini-3.5-flash',
-        env_var    => 'GEMINI_API_KEY',
-        short_name => 'gemini-flash',
+        provider       => 'gemini',
+        model_name     => 'gemini-3.5-flash',
+        env_var        => 'GEMINI_API_KEY',
+        short_name     => 'gemini-flash',
+        context_window => 1_000_000,
     },
     {
-        provider   => 'gemini',
-        model_name => 'gemini-3.1-flash-lite',
-        env_var    => 'GEMINI_API_KEY',
-        short_name => 'gemini-lite',
+        provider       => 'gemini',
+        model_name     => 'gemini-3.1-pro-preview',
+        env_var        => 'GEMINI_API_KEY',
+        short_name     => 'gemini-pro',
+        context_window => 1_000_000,
     },
     {
-        provider   => 'gemini',
-        model_name => 'gemini-3.1-pro-preview',
-        env_var    => 'GEMINI_API_KEY',
-        short_name => 'gemini-pro',
-    },
-    {
-        provider   => 'openai',
-        model_name => 'gpt-5-mini-2025-08-07',
-        env_var    => 'OPENAI_API_KEY',
-        short_name => 'gpt-5-mini',
-    },
-    {
-        provider   => 'openai',
-        model_name => 'gpt-5-nano-2025-08-07',
-        env_var    => 'OPENAI_API_KEY',
-        short_name => 'gpt-5-nano',
-    },
-    {
-        provider   => 'openai',
-        model_name => 'o3-2025-04-16',
-        env_var    => 'OPENAI_API_KEY',
-        short_name => 'o3',
+        provider       => 'openai',
+        model_name     => 'gpt-5-mini-2025-08-07',
+        env_var        => 'OPENAI_API_KEY',
+        short_name     => 'gpt-5-mini',
+        context_window => 400_000,
     },
     {
         provider                    => 'anthropic',
-        model_name                  => 'claude-sonnet-4-6',
+        model_name                  => 'claude-sonnet-5',
         env_var                     => 'ANTHROPIC_API_KEY',
         short_name                  => 'claude-sonnet',
         anthropic_supports_thinking => 1,
+        context_window              => 1_000_000,
     },
     {
-        provider   => 'anthropic',
-        model_name => 'claude-haiku-4-5',
-        env_var    => 'ANTHROPIC_API_KEY',
-        short_name => 'claude-haiku',
+        provider       => 'anthropic',
+        model_name     => 'claude-fable-5',
+        env_var        => 'ANTHROPIC_API_KEY',
+        short_name     => 'claude-fable',
+        context_window => 1_000_000,
+    },
+    {
+        provider       => 'anthropic',
+        model_name     => 'claude-haiku-4-5',
+        env_var        => 'ANTHROPIC_API_KEY',
+        short_name     => 'claude-haiku',
+        context_window => 200_000,
     },
     {
         provider                    => 'anthropic',
@@ -3775,6 +4107,28 @@ my @MODELS = (
         env_var                     => 'ANTHROPIC_API_KEY',
         short_name                  => 'claude-opus',
         anthropic_supports_thinking => 1,
+        context_window              => 1_000_000,
+    },
+    {
+        provider       => 'fireworks',
+        model_name     => 'accounts/fireworks/models/deepseek-v4-pro',
+        env_var        => 'FIREWORKS_API_KEY',
+        short_name     => 'deepseek',
+        context_window => 1_040_000,
+    },
+    {
+        provider       => 'fireworks',
+        model_name     => 'accounts/fireworks/models/deepseek-v4-flash',
+        env_var        => 'FIREWORKS_API_KEY',
+        short_name     => 'deepseek-flash',
+        context_window => 1_040_000,
+    },
+    {
+        provider       => 'fireworks',
+        model_name     => 'accounts/fireworks/models/glm-5p2',
+        env_var        => 'FIREWORKS_API_KEY',
+        short_name     => 'glm',
+        context_window => 1_000_000,
     },
 );
 
@@ -3978,11 +4332,6 @@ LINE: while (defined(my $input_line = read_line($user_shell_prompt))) {
     do {
         my $command_mode;
 
-        if ($question =~ /^(?: +)?,shell(?:\s(.*))?$/) {
-            $command_mode++;
-            $cmd_lookup->{shell}->($1);
-        }
-
         # Multi-line accumulation for ,apply_patch in the REPL.
         # When we see ,apply_patch ... '<<<<<< ORIGINAL on a line
         # but the closing >>>>>> UPDATED' hasn't arrived yet, read
@@ -3991,9 +4340,7 @@ LINE: while (defined(my $input_line = read_line($user_shell_prompt))) {
         # hand the whole thing to the apply_patch handler.
         my $left_marker_pat  = '<' . Synergy::Util::patch_marker_bounds();
         my $right_marker_pat = '>' . Synergy::Util::patch_marker_bounds();
-        if (  !$command_mode
-            && $question
-            =~ /^,apply_patch\s+(\S+)\s+'$left_marker_pat ORIGINAL/
+        if ($question =~ /^,apply_patch\s+(\S+)\s+'$left_marker_pat ORIGINAL/
             && $question !~ /$right_marker_pat UPDATED'/)
         {
             while (defined(my $next_line = read_line(''))) {
@@ -4009,39 +4356,25 @@ LINE: while (defined(my $input_line = read_line($user_shell_prompt))) {
             chomp $question;
         }
 
-        # This regular expression not only determines: do we enter
-        # command mode? It also determines what characters are allowed
-        # to be passed through as arguments to the various REPL
-        # commands. The ,exec command in particular then has to do its
-        # own shell metacharacter filtering out of some things that
-        # are allowed in here, such as e.g. the semicolon. The
-        # ,apply_patch command also has to allow in arbitrary text in
-        # order to edit various file types, hence the growth of the
-        # third capture group over time.
-        if (  !$command_mode
-            && $question
-            =~ /^( +)?,([a-zA-Z\_]+)?( +[ a-zA-Z0-9\@\/\.\-\_\"\' \,\;\`\<\>\=\n\#\!\\\:\(\)\$\[\]\{\}\|\^\?\*]+)?/
-          )
-        {
-
-            # do commands ...
-            my $maybe_command = $2;
-            my $maybe_arg     = $3;
-
-            if (   $maybe_command
-                && $maybe_arg
-                && exists $cmd_lookup->{$maybe_command})
+        # Any line whose first non-blank character is a comma is a
+        # command, never assistant input. The argument is passed
+        # through verbatim (including newlines from the multi-line
+        # accumulation above); each command does its own validation.
+        # Unknown or unparseable command lines print help.
+        if (!$command_mode && $question =~ /^[ \t]*,/) {
+            $command_mode++;
+            if ($question =~ /^[ \t]*,([a-zA-Z_]+)(?:[ \t]+(.*))?$/s
+                && exists $cmd_lookup->{$1})
             {
-                $command_mode++;
-                $maybe_arg =~ s/^ +//;
-                $cmd_lookup->{$maybe_command}->($maybe_arg);
-            }
-            elsif ($maybe_command && exists $cmd_lookup->{$maybe_command}) {
-                $command_mode++;
-                $cmd_lookup->{$maybe_command}->();
+                my ($command, $arg) = ($1, $2);
+                if (defined $arg && length $arg) {
+                    $cmd_lookup->{$command}->($arg);
+                }
+                else {
+                    $cmd_lookup->{$command}->();
+                }
             }
             else {
-                $command_mode++;
                 $cmd_lookup->{'help'}->();
             }
         }
@@ -4058,28 +4391,23 @@ LINE: while (defined(my $input_line = read_line($user_shell_prompt))) {
 
     my $start = time;
 
-    my $answer;
-    my $retry_count = 0;
-    my $success     = 0;
+    maybe_autocompact();
+    Synergy::ContextStack::announce_stale_context(
+        context_aref => \@context,
+        convo_aref   => \@convo,
+    );
+    Synergy::ContextStack::announce_git_delta(convo_aref => \@convo,);
 
-    while (!$success && $retry_count <= $MAX_RETRIES) {
-        try {
-            if ($retry_count > 0) {
-                ## Exponential backoff
-                my $delay = BASE_DELAY * (2**($retry_count - 1));
-                say STDERR
-                  qq[Retry attempt $retry_count after $delay second(s)...]
-                  unless $stdin_is_pipe;
-                sleep $delay;
-            }
-
+    my ($success, $answer) = call_assistant_with_retries(
+        max_retries => $MAX_RETRIES,
+        attempt     => sub {
             my $messages = Synergy::Prompt::build_request_messages(
                 convo        => \@convo,
                 context      => \@context,
                 sep          => $CONV_SEP,
                 user_message => $input_line,
             );
-            $answer = call_assistant(
+            return call_assistant(
                 provider         => $current_provider,
                 api_key          => $api_key,
                 model            => $current_model_config->{model_name},
@@ -4089,23 +4417,16 @@ LINE: while (defined(my $input_line = read_line($user_shell_prompt))) {
                 user_message     => $input_line,
                 anthropic_thinking_enabled => 0,
             );
-            $success = 1;
+        },
+    );
+    unless ($success) {
+        if (($answer // '') =~ /^canceled:/) {
+            $answer = '[request canceled by user]';
         }
-        catch {
-            my $error = $_;
-            $retry_count++;
-
-            if ($retry_count <= $MAX_RETRIES) {
-                say STDERR
-                  qq[API call failed: $error - retrying ($retry_count/$MAX_RETRIES)]
-                  unless $stdin_is_pipe;
-            }
-            else {
-                $answer
-                  = qq[API call failed after $MAX_RETRIES retries: $error];
-                say STDERR qq[$answer] unless $stdin_is_pipe;
-            }
-        };
+        else {
+            $answer = qq[API call failed after $MAX_RETRIES retries: $answer];
+            say STDERR qq[$answer] unless $stdin_is_pipe;
+        }
     }
 
     my $end = time;
@@ -4138,7 +4459,7 @@ LINE: while (defined(my $input_line = read_line($user_shell_prompt))) {
 
     unless ($stdin_is_pipe) {
         my $cache_note = '';
-        if ($current_provider eq 'openai'
+        if ($current_provider =~ /^(?:openai|fireworks)$/
             && defined $last_openai_cached_tokens)
         {
             my $cached = $last_openai_cached_tokens;
@@ -4169,6 +4490,106 @@ if ($auto_dump_mode && $active_dump_file) {
     $cmd_lookup->{dump}->($active_dump_file);
 }
 
+# Automatic context compaction. Before each assistant call, compare
+# the last server-reported prompt size against the active model's
+# compaction threshold and rewrite the history via run_collect when it
+# crosses. SYNERGY_AUTOCOMPACT_TOKENS overrides the threshold as an
+# absolute token count; 0 disables. Models without a context_window
+# never compact.
+sub autocompact_threshold {
+    my $override = $ENV{SYNERGY_AUTOCOMPACT_TOKENS};
+    return $override if defined($override) && $override =~ /^\d+$/;
+
+    my $window = $current_model_config->{context_window};
+    return 0 unless $window;
+    return int($window * 0.85);
+}
+
+sub maybe_autocompact {
+    my $threshold = autocompact_threshold();
+    return unless $threshold;
+    return
+      unless defined($last_prompt_tokens)
+      && $last_prompt_tokens >= $threshold;
+
+    my $note = "collect: auto-compacting conversation history "
+      . "($last_prompt_tokens tokens >= $threshold token threshold)";
+    say $note;
+    Synergy::Util::append_to_log($logfile, $note);
+
+    Synergy::Commands::run_collect(
+        convo_aref        => \@convo,
+        context_aref      => \@context,
+        synergy_root      => $synergy_root,
+        provider          => $current_provider,
+        api_key           => $api_key,
+        model             => $current_model_config->{model_name},
+        conv_sep          => $CONV_SEP,
+        logfile           => $logfile,
+        call_assistant_cb => \&call_assistant,
+    );
+
+    # Wait for fresh server-reported usage before checking again; this
+    # also keeps a failed compaction from retrying on every turn.
+    $last_prompt_tokens = undef;
+
+    say "NOTE: Long threads and repeated compactions reduce model"
+      . " accuracy. Start a new session when possible.";
+    return;
+}
+
+# Run one assistant call with exponential-backoff retries. `attempt`
+# does the per-try work (build messages, call the API) and returns the
+# assistant reply. Returns (1, $reply) on success or (0, $error) once
+# retries are exhausted; progress goes to STDERR unless stdin is a pipe.
+sub call_assistant_with_retries {
+    my (%args)      = @_;
+    my $attempt     = $args{attempt};
+    my $max_retries = $args{max_retries};
+    my $log_prefix  = $args{log_prefix} // '';
+
+    my ($result, $final_error);
+    my $retry_count = 0;
+    my $success     = 0;
+
+    while (!$success && $retry_count <= $max_retries) {
+        try {
+            if ($retry_count > 0) {
+                my $delay = BASE_DELAY * (2**($retry_count - 1));
+                say STDERR
+                  qq[${log_prefix}Retry attempt $retry_count after $delay second(s)...]
+                  unless $stdin_is_pipe;
+                sleep $delay;
+            }
+            $result  = $attempt->();
+            $success = 1;
+        }
+        catch {
+            my $error = $_;
+
+            # A user cancellation is final, never retried.
+            if ($error =~ /^canceled:/) {
+                $final_error = $error;
+                $retry_count = $max_retries + 1;
+                return;
+            }
+
+            $retry_count++;
+
+            if ($retry_count <= $max_retries) {
+                say STDERR
+                  qq[${log_prefix}API call failed: $error - retrying ($retry_count/$max_retries)]
+                  unless $stdin_is_pipe;
+            }
+            else {
+                $final_error = $error;
+            }
+        };
+    }
+
+    return $success ? (1, $result) : (0, $final_error);
+}
+
 sub call_assistant {
     my (%args)           = @_;
     my $provider         = $args{provider};
@@ -4189,14 +4610,7 @@ sub call_assistant {
         return $ENV{SYNERGY_OFFLINE_RESPONSE} // '[SYNERGY_OFFLINE]';
     }
 
-    my $provider_def = Synergy::Provider::provider_def(
-        provider                      => $provider,
-        JSON                          => $JSON,
-        last_openai_cached_tokens_ref => \$last_openai_cached_tokens,
-        last_openai_prompt_tokens_ref => \$last_openai_prompt_tokens,
-        last_anthropic_thinking_ref   => \$last_anthropic_thinking,
-        session_token_usage_ref       => $session_token_usage,
-    );
+    my $provider_def = Synergy::Provider::provider_def(provider => $provider);
 
     my $body;
     if ($ENV{SYNERGY_CURL_STUB}) {
@@ -4233,9 +4647,24 @@ sub call_assistant {
         }
         $body = $result->{body};
     }
-    my $content = $provider_def->{parse}->($body);
+    my $parsed  = $provider_def->{parse}->($body, $JSON);
+    my $content = $parsed->{content};
+    my $usage   = $parsed->{usage} // {};
 
-    if ($provider eq 'openai' && defined $last_openai_prompt_tokens) {
+    Synergy::Provider::accumulate_session_usage($session_token_usage, $usage);
+    $last_prompt_tokens = $usage->{prompt_tokens}
+      if defined $usage->{prompt_tokens};
+    if ($provider =~ /^(?:openai|fireworks)$/) {
+        $last_openai_prompt_tokens = $usage->{input_tokens}
+          if defined $usage->{input_tokens};
+        $last_openai_cached_tokens = $usage->{cached_tokens}
+          if defined $usage->{cached_tokens};
+    }
+    $last_anthropic_thinking = $parsed->{thinking};
+
+    if ($provider =~ /^(?:openai|fireworks)$/
+        && defined $last_openai_prompt_tokens)
+    {
         my $cached
           = defined($last_openai_cached_tokens)
           ? $last_openai_cached_tokens
@@ -4264,13 +4693,19 @@ sub call_assistant {
 }
 
 sub sigint_handler {
+
+    # A Ctrl-C while a model request is in flight cancels the request.
+    $Synergy::HTTP::cancel_requested = 1 if $Synergy::HTTP::in_flight;
+
     if ($agent_mode) {
         $agent_mode = undef;
         print
           "\nAGENT MODE: Interrupted by user. Returning control to REPL.\n";
         print $user_shell_prompt unless $use_readline;
     }
-    else {
+    elsif (!$Synergy::HTTP::in_flight) {
+
+        # Only a Ctrl-C at the prompt asks about quitting.
         $sigint_recvd = 1;
     }
 }
@@ -4299,7 +4734,7 @@ If you go to the Terminal and start C<synergy>, a prompt appears. You can type q
 
 Synergy also accepts special commands starting with a comma. These commands are not sent to the AI assistant. Instead, they control the state of the REPL. For example, you can add a text file into the context of the current conversation, or serialize the current session to disk as an XML file.
 
-When you add a file to the context, it is stored in a stack. There are several stack manipulation commands for pushing, popping, rotating, etc.
+When you add a file to the context, it is stored in a stack. There are several stack manipulation commands for pushing, popping, and inspecting entries.
 
 =head3 Noninteractive mode (input via pipe)
 

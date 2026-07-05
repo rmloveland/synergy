@@ -380,7 +380,7 @@ my $bell = chr 7;
     );
     like(
         $results->{stdout},
-        qr/Allow this git command to run\? \[y\/N\]/,
+        qr/Allow this git command to run\? \[y\/N\/a\]/,
         "agent git deny: confirmation prompt shown"
     );
     like(
@@ -419,7 +419,7 @@ my $bell = chr 7;
     );
     like(
         $results->{stdout},
-        qr/Allow this git command to run\? \[y\/N\]/,
+        qr/Allow this git command to run\? \[y\/N\/a\]/,
         "agent git allow: confirmation prompt shown"
     );
     like(
@@ -627,7 +627,7 @@ my $bell = chr 7;
 
     unlike(
         $results->{stdout},
-        qr/Allow this git command to run\? \[y\/N\]/,
+        qr/Allow this git command to run\? \[y\/N\/a\]/,
         "yolo mode: git runs without confirmation prompt"
     );
     unlike(
@@ -662,35 +662,6 @@ my $bell = chr 7;
     );
 }
 
-=head3 Test agent mode rejects unquoted multi-word git commit messages
-
-=cut
-
-{
-    local $ENV{SYNERGY_OFFLINE_RESPONSE}
-      = ",exec git commit -m Add replace review navigation and undo status\n,comment AGENT_COMPLETE: denied";
-    local $ENV{SYNERGY_AGENT_FAST} = 1;
-
-    my $results = run_synergy_file_session(
-        [",agent git commit quoting check\n", ",history\n", ",exit\n",]);
-
-    like(
-        $results->{stdout},
-        qr/ERROR: git commit message arguments must be quoted; use git commit -m "subject" -m "body" or git commit -F file/,
-        "agent git commit quoting: surfaces targeted parse error"
-    );
-    unlike(
-        $results->{stdout},
-        qr/Allow this git command to run\? \[y\/N\]/,
-        "agent git commit quoting: does not prompt for approval"
-    );
-    unlike(
-        $results->{stdout},
-        qr/exec: git commit -m Add replace review navigation and undo status/,
-        "agent git commit quoting: invalid command is not executed"
-    );
-}
-
 =head3 Test agent mode asks before running generic commands and records denial
 
 =cut
@@ -714,7 +685,7 @@ my $bell = chr 7;
     );
     like(
         $results->{stdout},
-        qr/Allow this command to run\? \[y\/N\]/,
+        qr/Allow this command to run\? \[y\/N\/a\]/,
         "agent generic deny: confirmation prompt shown"
     );
     like(
@@ -753,7 +724,7 @@ my $bell = chr 7;
     );
     like(
         $results->{stdout},
-        qr/Allow this command to run\? \[y\/N\]/,
+        qr/Allow this command to run\? \[y\/N\/a\]/,
         "agent generic allow: confirmation prompt shown"
     );
     like(
@@ -784,7 +755,7 @@ my $bell = chr 7;
     );
     unlike(
         $results->{stdout},
-        qr/Allow this command to run\? \[y\/N\]/,
+        qr/Allow this command to run\? \[y\/N\/a\]/,
         "agent deny rm: no confirmation prompt shown"
     );
     unlike(
@@ -818,7 +789,7 @@ my $bell = chr 7;
     );
     unlike(
         $results->{stdout},
-        qr/Allow this command to run\? \[y\/N\]/,
+        qr/Allow this command to run\? \[y\/N\/a\]/,
         "agent deny basename: no confirmation prompt shown"
     );
     unlike(
@@ -851,7 +822,7 @@ my $bell = chr 7;
     );
     unlike(
         $results->{stdout},
-        qr/Allow this command to run\? \[y\/N\]/,
+        qr/Allow this command to run\? \[y\/N\/a\]/,
         "agent deny shell wrapper: no confirmation prompt shown"
     );
     unlike(
@@ -866,7 +837,7 @@ my $bell = chr 7;
     );
 }
 
-=head3 Test agent mode rejects ,shell explicitly
+=head3 Test agent mode treats removed ,shell as an unknown command
 
 =cut
 
@@ -880,19 +851,185 @@ my $bell = chr 7;
 
     like(
         $results->{stdout},
-        qr/ERROR: ,shell is not available in agent mode/,
-        "agent shell: explicit rejection message shown"
+        qr/AGENT ERROR: Unknown command ',shell'/,
+        "agent shell: removed command is unknown"
     );
     unlike(
         $results->{stdout},
         qr/shell: printf nope/,
         "agent shell: command was not executed"
     );
+}
+
+=head3 Test agent pipelines: allowlisted segments run without prompting
+
+=cut
+
+{
+    local $ENV{SYNERGY_OFFLINE_RESPONSE}
+      = ",exec cat /etc/hosts | wc -l\n,comment AGENT_COMPLETE: piped";
+    local $ENV{SYNERGY_AGENT_FAST} = 1;
+
+    my $results = run_synergy_file_session(
+        [",agent pipeline allow check\n", ",exit\n",]);
+
+    unlike(
+        $results->{stdout},
+        qr/Allow this command to run\?/,
+        "agent pipeline: allowlisted segments need no approval"
+    );
     like(
         $results->{stdout},
-        qr/\[\d+\]: ERROR: ,shell is not available in agent mode/,
-        "agent shell: rejection recorded in history"
+        qr/exec: cat \/etc\/hosts \| wc -l/,
+        "agent pipeline: pipeline executed"
     );
+    is($results->{exit_code}, 0, "agent pipeline: exits cleanly");
+}
+
+=head3 Test agent pipelines: a denied segment blocks the whole pipeline
+
+=cut
+
+{
+    local $ENV{SYNERGY_OFFLINE_RESPONSE}
+      = ",exec cat /etc/hosts | rm -f /tmp/agent-pipe-block\n,comment AGENT_COMPLETE: denied";
+    local $ENV{SYNERGY_AGENT_FAST} = 1;
+
+    my $results = run_synergy_file_session(
+        [",yolo\n", ",agent pipeline deny check\n", ",exit\n",]);
+
+    like(
+        $results->{stdout},
+        qr/AGENT INFO: command denied by policy: rm/,
+        "agent pipeline deny: denied segment reported even in yolo mode"
+    );
+    unlike(
+        $results->{stdout},
+        qr/exec: cat \/etc\/hosts \| rm/,
+        "agent pipeline deny: pipeline was not executed"
+    );
+}
+
+=head3 Test 'a' answer approves an exact command for the session
+
+=cut
+
+{
+    my $capture_dir = tempdir(CLEANUP => 1);
+    my $curl_dir    = tempdir(CLEANUP => 1);
+    write_fake_curl($curl_dir);
+    local $ENV{SYNERGY_CURL_CAPTURE_DIR} = $capture_dir;
+    local $ENV{PATH}                     = "$curl_dir:$ENV{PATH}";
+    local $ENV{OPENAI_API_KEY}           = "OPENAI_KEY_TEST";
+    local $ENV{SYNERGY_CURL_FAKE_BODY_1}
+      = '{"choices":[{"message":{"content":",exec git rev-parse --is-inside-work-tree"}}]}';
+    local $ENV{SYNERGY_CURL_FAKE_BODY_2}
+      = '{"choices":[{"message":{"content":",exec git rev-parse --is-inside-work-tree"}}]}';
+    local $ENV{SYNERGY_CURL_FAKE_BODY_3}
+      = '{"choices":[{"message":{"content":",exec git log --oneline -1"}}]}';
+    local $ENV{SYNERGY_CURL_FAKE_BODY_4}
+      = '{"choices":[{"message":{"content":",comment AGENT_COMPLETE: done"}}]}';
+    local $ENV{SYNERGY_AGENT_FAST} = 1;
+
+    my $results = run_synergy_file_session(
+        [
+            ",model gpt-5\n",
+            ",agent session approval check\n",
+            "a\n", "n\n", ",exit\n"
+        ]
+    );
+
+    like(
+        $results->{stdout},
+        qr/Approved for the rest of this session: git rev-parse --is-inside-work-tree/,
+        "session approval: 'a' answer records the exact command"
+    );
+
+    my @prompts
+      = ($results->{stdout} =~ /(Allow this git command to run\?)/g);
+    is(
+        scalar @prompts,
+        2,
+        "session approval: repeat of approved command does not re-prompt; a different command does"
+    );
+
+    my @runs = (
+        $results->{stdout} =~ /(exec: git rev-parse --is-inside-work-tree)/g);
+    ok(scalar @runs >= 2,
+        "session approval: approved command executed on both turns");
+    unlike(
+        $results->{stdout},
+        qr/exec: git log --oneline -1/,
+        "session approval: different command still gated (denied here)"
+    );
+}
+
+=head3 Test ,ask pauses the agent for the user's answer
+
+=cut
+
+{
+    my $capture_dir = tempdir(CLEANUP => 1);
+    my $curl_dir    = tempdir(CLEANUP => 1);
+    write_fake_curl($curl_dir);
+    local $ENV{SYNERGY_CURL_CAPTURE_DIR} = $capture_dir;
+    local $ENV{PATH}                     = "$curl_dir:$ENV{PATH}";
+    local $ENV{OPENAI_API_KEY}           = "OPENAI_KEY_TEST";
+    local $ENV{SYNERGY_CURL_FAKE_BODY_1}
+      = '{"choices":[{"message":{"content":",ask Which color should the button be?"}}]}';
+    local $ENV{SYNERGY_CURL_FAKE_BODY_2}
+      = '{"choices":[{"message":{"content":",comment AGENT_COMPLETE: done"}}]}';
+    local $ENV{SYNERGY_AGENT_FAST} = 1;
+
+    my $results = run_synergy_file_session(
+        [
+            ",model gpt-5\n", ",agent ask check\n",
+            "blue\n",         ",history\n",
+            ",exit\n"
+        ]
+    );
+
+    is($results->{exit_code}, 0, "agent ask: exits cleanly");
+    like(
+        $results->{stdout},
+        qr/agent asks: Which color should the button be\?/,
+        "agent ask: question is shown to the user"
+    );
+    like(
+        $results->{stdout},
+        qr/your reply: /,
+        "agent ask: reply prompt shown"
+    );
+    like(
+        $results->{stdout},
+        qr/\[\d+\]: AGENT QUESTION: Which color should the button be\?\nUSER ANSWER: blue/,
+        "agent ask: question and answer recorded in history"
+    );
+    my $second_body = slurp("$capture_dir/req_2_body.json");
+    like(
+        $second_body,
+        qr/USER ANSWER: blue/,
+        "agent ask: the answer reaches the model on the next turn"
+    );
+    unlike(
+        $results->{stdout},
+        qr/WARNING: agent completed without running any commands/,
+        "agent ask: asking counts as agent activity"
+    );
+}
+
+=head3 Test ,ask outside agent mode is rejected
+
+=cut
+
+{
+    my $results = run_synergy_session([",ask what now?\n", ",exit\n"]);
+    like(
+        $results->{stdout},
+        qr/ERROR: ,ask pauses an agent for the user's answer/,
+        ",ask human mode: explains itself instead of prompting"
+    );
+    is($results->{exit_code}, 0, ",ask human mode: exits cleanly");
 }
 
 =head3 Test agent mode asks before running perl one-liners
@@ -914,7 +1051,7 @@ my $bell = chr 7;
     );
     like(
         $results->{stdout},
-        qr/Allow this command to run\? \[y\/N\]/,
+        qr/Allow this command to run\? \[y\/N\/a\]/,
         "agent perl deny: confirmation prompt shown"
     );
     like(
@@ -948,7 +1085,7 @@ my $bell = chr 7;
     );
     like(
         $results->{stdout},
-        qr/Allow this command to run\? \[y\/N\]/,
+        qr/Allow this command to run\? \[y\/N\/a\]/,
         "agent perl allow: confirmation prompt shown"
     );
     like(
@@ -989,31 +1126,26 @@ my $bell = chr 7;
     my $body = decode_json(slurp($body_file));
     my $sys  = $body->{input}[0]{content} // '';
 
-    my $static_idx
-      = index($sys, "**OPERATIONAL GUIDELINES for SYNERGY Agent Mode:**");
-
-    ok($static_idx >= 0,
-        "agent prompt ordering: static guidelines block exists");
-    unlike(
+    ok(
+        index($sys, "**OPERATIONAL GUIDELINES for SYNERGY Agent Mode:**") < 0,
+        "agent prompt ordering: guidelines moved out of the system prompt"
+    );
+    like(
         $sys,
-        qr/Here is the history of the conversation to this point/,
-        "agent prompt ordering: dynamic conversation block no longer lives in system prompt"
+        qr/You are SYNERGY, a concise technical collaborator/,
+        "agent prompt ordering: agent requests use the plain chat system prompt"
     );
     unlike(
         $sys,
         qr/Relevant file\/context state/,
-        "agent prompt ordering: dynamic context block no longer lives in system prompt"
+        "agent prompt ordering: dynamic context block does not live in system prompt"
     );
     ok(
-        (
-            grep {
-                     ($_->{role} // '') eq 'user'
-                  && ($_->{content} // '') =~ /Agent task and environment:/
-                  && ($_->{content} // '')
-                  =~ /cache-ordering-check/
-            } @{$body->{input}}
+        !(
+            grep { ($_->{content} // '') =~ /Agent task and environment:/ }
+            @{$body->{input}}
         ),
-        "agent prompt ordering: task and environment sent as user message"
+        "agent prompt ordering: no task/environment message ahead of the context"
     );
     ok(
         (
@@ -1027,16 +1159,31 @@ my $bell = chr 7;
         "agent prompt ordering: file context sent as user message"
     );
     ok(
-        !(
+        (
             grep { ($_->{content} // '') =~ /agent: cache-ordering-check/ }
-            @{$body->{input}}
+              @{$body->{input}}
         ),
-        "agent prompt ordering: synthetic task history omitted from message stream"
+        "agent prompt ordering: task history entry stays in the message stream"
     );
     like(
         $body->{input}[-1]{content} // '',
         qr/Agent next turn:/,
         "agent prompt ordering: current turn prompt is final message"
+    );
+    like(
+        $body->{input}[-1]{content} // '',
+        qr/\*\*OPERATIONAL GUIDELINES for SYNERGY Agent Mode:\*\*/,
+        "agent prompt ordering: guidelines ride in the final turn message"
+    );
+    like(
+        $body->{input}[-1]{content} // '',
+        qr/Task:\ncache-ordering-check/,
+        "agent prompt ordering: task rides in the final turn message"
+    );
+    like(
+        $body->{input}[-1]{content} // '',
+        qr/Working Directory: /,
+        "agent prompt ordering: working directory rides in the final turn message"
     );
     like(
         $body->{input}[-1]{content} // '',
@@ -1109,30 +1256,31 @@ my $bell = chr 7;
       : ($body->{system} // '');
 
     ok(
-        index($sys, "**OPERATIONAL GUIDELINES for SYNERGY Agent Mode:**")
-          >= 0,
-        "agent prompt ordering anthropic: static guidelines block exists"
+        index($sys, "**OPERATIONAL GUIDELINES for SYNERGY Agent Mode:**") < 0,
+        "agent prompt ordering anthropic: guidelines moved out of the system prompt"
     );
-    unlike(
+    like(
         $sys,
-        qr/Here is the history of the conversation to this point/,
-        "agent prompt ordering anthropic: dynamic conversation block no longer lives in system prompt"
+        qr/You are SYNERGY, a concise technical collaborator/,
+        "agent prompt ordering anthropic: agent requests use the plain chat system prompt"
     );
     unlike(
         $sys,
         qr/Relevant file\/context state/,
-        "agent prompt ordering anthropic: dynamic context block no longer lives in system prompt"
+        "agent prompt ordering anthropic: dynamic context block does not live in system prompt"
     );
     ok(
-        (
+        !(
             grep {
-                     ($_->{role} // '') eq 'user'
-                  && ($_->{content} // '') =~ /Agent task and environment:/
-                  && ($_->{content} // '')
-                  =~ /anthropic-cache-ordering-check/
+                my $c = $_->{content};
+                (
+                    ref($c)
+                    ? join('', map { $_->{text} // '' } @$c)
+                    : ($c // ''))
+                  =~ /Agent task and environment:/
             } @{$body->{messages}}
         ),
-        "agent prompt ordering anthropic: task and environment sent as user message"
+        "agent prompt ordering anthropic: no task/environment message ahead of the context"
     );
     my ($context_index, $context_block);
     for my $i (0 .. $#{$body->{messages}}) {
@@ -1160,18 +1308,32 @@ my $bell = chr 7;
         "agent prompt ordering anthropic: context block has cache control"
     );
     ok(
-        !(
+        (
             grep {
-                ($_->{content} // '')
+                my $c = $_->{content};
+                (
+                    ref($c)
+                    ? join('', map { $_->{text} // '' } @$c)
+                    : ($c // ''))
                   =~ /agent: anthropic-cache-ordering-check/
             } @{$body->{messages}}
         ),
-        "agent prompt ordering anthropic: synthetic task history omitted from message stream"
+        "agent prompt ordering anthropic: task history entry stays in the message stream"
     );
+    my $last_content = $body->{messages}[-1]{content};
+    my $last_text
+      = ref($last_content)
+      ? join('', map { $_->{text} // '' } @$last_content)
+      : ($last_content // '');
     like(
-        $body->{messages}[-1]{content} // '',
+        $last_text,
         qr/Agent next turn:/,
         "agent prompt ordering anthropic: current turn prompt is final message"
+    );
+    like(
+        $last_text,
+        qr/\*\*OPERATIONAL GUIDELINES for SYNERGY Agent Mode:\*\*/,
+        "agent prompt ordering anthropic: guidelines ride in the final turn message"
     );
     is($body->{thinking}{type},
         "adaptive",
@@ -1214,31 +1376,26 @@ my $bell = chr 7;
     my $sys  = $body->{contents}[0]{parts}[0]{text} // '';
 
     ok(
-        index($sys, "**OPERATIONAL GUIDELINES for SYNERGY Agent Mode:**")
-          >= 0,
-        "agent prompt ordering gemini: static guidelines block exists"
+        index($sys, "**OPERATIONAL GUIDELINES for SYNERGY Agent Mode:**") < 0,
+        "agent prompt ordering gemini: guidelines moved out of the system prompt"
     );
-    unlike(
+    like(
         $sys,
-        qr/Here is the history of the conversation to this point/,
-        "agent prompt ordering gemini: dynamic conversation block no longer lives in system prompt"
+        qr/You are SYNERGY, a concise technical collaborator/,
+        "agent prompt ordering gemini: agent requests use the plain chat system prompt"
     );
     unlike(
         $sys,
         qr/Relevant file\/context state/,
-        "agent prompt ordering gemini: dynamic context block no longer lives in system prompt"
+        "agent prompt ordering gemini: dynamic context block does not live in system prompt"
     );
     ok(
-        (
+        !(
             grep {
-                     ($_->{role} // '') eq 'user'
-                  && ($_->{parts}[0]{text} // '')
-                  =~ /Agent task and environment:/
-                  && ($_->{parts}[0]{text} // '')
-                  =~ /gemini-cache-ordering-check/
+                ($_->{parts}[0]{text} // '') =~ /Agent task and environment:/
             } @{$body->{contents}}
         ),
-        "agent prompt ordering gemini: task and environment sent as user message"
+        "agent prompt ordering gemini: no task/environment message ahead of the context"
     );
     ok(
         (
@@ -1253,18 +1410,91 @@ my $bell = chr 7;
         "agent prompt ordering gemini: file context sent as user message"
     );
     ok(
-        !(
+        (
             grep {
                 ($_->{parts}[0]{text} // '')
                   =~ /agent: gemini-cache-ordering-check/
             } @{$body->{contents}}
         ),
-        "agent prompt ordering gemini: synthetic task history omitted from message stream"
+        "agent prompt ordering gemini: task history entry stays in the message stream"
     );
     like(
         $body->{contents}[-1]{parts}[0]{text} // '',
         qr/Agent next turn:/,
         "agent prompt ordering gemini: current turn prompt is final message"
+    );
+    like(
+        $body->{contents}[-1]{parts}[0]{text} // '',
+        qr/\*\*OPERATIONAL GUIDELINES for SYNERGY Agent Mode:\*\*/,
+        "agent prompt ordering gemini: guidelines ride in the final turn message"
+    );
+}
+
+=head3 Test chat and agent requests share a byte-identical prefix
+
+The entire point of the unified layout: a chat turn followed by an
+agent run must produce requests whose system prompt and leading
+messages match exactly, so the agent run extends the session's
+server-side prompt cache instead of forking it.
+
+=cut
+
+{
+    my $capture_dir = tempdir(CLEANUP => 1);
+    my $curl_dir    = tempdir(CLEANUP => 1);
+    write_fake_curl($curl_dir);
+    local $ENV{SYNERGY_CURL_CAPTURE_DIR} = $capture_dir;
+    local $ENV{PATH}                     = "$curl_dir:$ENV{PATH}";
+    local $ENV{OPENAI_API_KEY}           = "OPENAI_KEY_TEST";
+    local $ENV{SYNERGY_CURL_FAKE_BODY_1}
+      = '{"choices":[{"message":{"content":"CHAT_REPLY_OK"}}]}';
+    local $ENV{SYNERGY_CURL_FAKE_BODY_2}
+      = '{"choices":[{"message":{"content":",exec ls\n,comment AGENT_COMPLETE: done"}}]}';
+    local $ENV{SYNERGY_AGENT_FAST} = 1;
+
+    # A directory with no AGENTS.md, so entering agent mode does not
+    # auto-push new context (a legitimate prefix change that would
+    # obscure what this test pins down).
+    my $probe_dir = tempdir(CLEANUP => 1);
+
+    my $results = run_synergy_file_session(
+        [
+            ",cd $probe_dir\n",
+            ",model gpt-5\n",
+            "shared prefix probe\n",
+            ",agent prefix-share-task\n",
+            ",exit\n"
+        ]
+    );
+
+    is($results->{exit_code}, 0, "shared prefix: exits cleanly");
+
+    my $chat_body  = decode_json(slurp("$capture_dir/req_1_body.json"));
+    my $agent_body = decode_json(slurp("$capture_dir/req_2_body.json"));
+
+    is_deeply(
+        $agent_body->{input}[0],
+        $chat_body->{input}[0],
+        "shared prefix: system prompt is byte-identical across modes"
+    );
+
+    # The live chat message is sent with its trailing newline, then
+    # recorded chomped in history; only content after the cache
+    # breakpoint differs, so this costs nothing.
+    my $chat_turn = $chat_body->{input}[-1]{content} // '';
+    chomp $chat_turn;
+    is($agent_body->{input}[1]{content}, $chat_turn,
+        "shared prefix: the chat turn leads the agent request's history unchanged"
+    );
+    like(
+        $agent_body->{input}[2]{content} // '',
+        qr/CHAT_REPLY_OK/,
+        "shared prefix: assistant reply follows in the agent request's history"
+    );
+    is(
+        $agent_body->{prompt_cache_key},
+        $chat_body->{prompt_cache_key},
+        "shared prefix: both modes use the same prompt cache key"
     );
 }
 

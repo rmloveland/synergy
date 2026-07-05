@@ -26,7 +26,7 @@ sub anthropic_body {
     my (%args) = @_;
 
     return {
-        model      => 'claude-sonnet-4-6',
+        model      => 'claude-sonnet-5',
         max_tokens => 8192,
         system     => [
             {
@@ -66,7 +66,7 @@ sub anthropic_context_body {
       {role => 'user', content => $args{message} // 'volatile user message'};
 
     return {
-        model      => 'claude-sonnet-4-6',
+        model      => 'claude-sonnet-5',
         max_tokens => 8192,
         system     => [{type => 'text', text => 'uncached system prompt',}],
         messages   => \@messages,
@@ -711,6 +711,195 @@ sub _contains_cache_control {
         $second->{system}[0]{cache_control},
         {type => 'ephemeral'},
         'anthropic fake curl cache: generated request keeps system breakpoint'
+    );
+}
+
+sub _count_cache_control {
+    my ($value) = @_;
+    my $count = 0;
+    if (ref($value) eq 'HASH') {
+        $count++ if exists $value->{cache_control};
+        $count += _count_cache_control($_) for values %$value;
+    }
+    elsif (ref($value) eq 'ARRAY') {
+        $count += _count_cache_control($_) for @$value;
+    }
+    return $count;
+}
+
+=head3 Test Anthropic interactive requests cache the growing conversation
+
+Prompt caching is a prefix match, so the request must be ordered stable
+content first: system, then the pushed file context, then history, with
+the volatile live prompt last. The newest history message carries a
+cache breakpoint so each turn extends the previous turn's cached prefix
+instead of invalidating it; the live user message stays an uncached
+plain string because it only becomes cacheable once it is history.
+
+=cut
+
+{
+    my $capture_dir = tempdir(CLEANUP => 1);
+    my $curl_dir    = tempdir(CLEANUP => 1);
+    write_fake_curl($curl_dir);
+
+    my $context_file = "$temp_dir/anthropic_ordering_context_$$.txt";
+    open my $cfh, '>', $context_file or die "Cannot create $context_file: $!";
+    print {$cfh} "stable Anthropic ordering context line\n";
+    close $cfh;
+
+    my %env = (
+        SYNERGY_CURL_CAPTURE_DIR => $capture_dir,
+        PATH                     => "$curl_dir:$ENV{PATH}",
+        ANTHROPIC_API_KEY        => 'ANTHROPIC_KEY_TEST',
+        SYNERGY_CURL_FAKE_BODY   =>
+          '{"content":[{"type":"text","text":"ORDERING_REPLY"}]}',
+    );
+
+    my $results = run_synergy_session(
+        [
+            ",model claude-sonnet\n",
+            ",push $context_file\n",
+            "first ordering turn\n",
+            "second ordering turn\n",
+            ",exit\n"
+        ],
+        undef,
+        \%env,
+    );
+    is($results->{exit_code}, 0, 'anthropic ordering: session exits cleanly');
+
+    my @bodies = sort glob("$capture_dir/req_*_body.json");
+    is(scalar @bodies, 2, 'anthropic ordering: captured both requests');
+
+    my $second   = decode_json(slurp($bodies[1]));
+    my $messages = $second->{messages};
+
+    my $first_content = $messages->[0]{content};
+    ok(
+        ref($first_content) eq 'ARRAY'
+          && ($first_content->[0]{text} // '')
+          =~ /Relevant file\/context state/,
+        'anthropic ordering: context block precedes conversation history'
+    );
+    is_deeply(
+        $first_content->[0]{cache_control},
+        {type => 'ephemeral'},
+        'anthropic ordering: context block keeps its breakpoint'
+    );
+
+    my $history_tail = $messages->[-2];
+    is($history_tail->{role}, 'assistant',
+        'anthropic ordering: newest history message is the prior reply');
+    ok(ref($history_tail->{content}) eq 'ARRAY',
+        'anthropic ordering: newest history message is a content block');
+    like(
+        $history_tail->{content}[0]{text} // '',
+        qr/ORDERING_REPLY/,
+        'anthropic ordering: newest history message carries prior reply text'
+    );
+    is_deeply(
+        $history_tail->{content}[0]{cache_control},
+        {type => 'ephemeral'},
+        'anthropic ordering: newest history message carries a breakpoint'
+    );
+
+    is($messages->[-1]{role},
+        'user', 'anthropic ordering: live prompt is the final message');
+    ok(!ref($messages->[-1]{content}),
+        'anthropic ordering: live prompt stays a plain uncached string');
+    like(
+        $messages->[-1]{content},
+        qr/second ordering turn/,
+        'anthropic ordering: live prompt content preserved'
+    );
+
+    is(_count_cache_control($second), 3,
+        'anthropic ordering: system + context + history is three breakpoints'
+    );
+
+    # The ,push command logs a history entry, so even the first turn
+    # has a history tail to mark.
+    my $first_body = decode_json(slurp($bodies[0]));
+    is(_count_cache_control($first_body),
+        3, 'anthropic ordering: first turn marks its history tail too');
+    like($first_body->{messages}[-2]{content}[0]{text} // '',
+        qr/^push: /,
+        'anthropic ordering: first turn history tail is the push note');
+    ok(!ref($first_body->{messages}[-1]{content}),
+        'anthropic ordering: first turn live prompt is uncached');
+}
+
+=head3 Test shared builder puts file context before history (OpenAI)
+
+The message reorder lives in the shared prompt builder, so pinning it
+through the OpenAI request shape covers Gemini as well. OpenAI and
+Gemini rely on automatic prefix caching: ordering matters, but no
+Anthropic cache_control or builder tags may leak into their wire
+format.
+
+=cut
+
+{
+    my $capture_dir = tempdir(CLEANUP => 1);
+    my $curl_dir    = tempdir(CLEANUP => 1);
+    write_fake_curl($curl_dir);
+
+    my $context_file = "$temp_dir/openai_ordering_context_$$.txt";
+    open my $cfh, '>', $context_file or die "Cannot create $context_file: $!";
+    print {$cfh} "stable OpenAI ordering context line\n";
+    close $cfh;
+
+    my %env = (
+        SYNERGY_CURL_CAPTURE_DIR => $capture_dir,
+        PATH                     => "$curl_dir:$ENV{PATH}",
+        OPENAI_API_KEY           => 'OPENAI_KEY_TEST',
+    );
+
+    my $results = run_synergy_session(
+        [
+            ",model gpt-5\n",
+            ",push $context_file\n",
+            "first shared ordering turn\n",
+            "second shared ordering turn\n",
+            ",exit\n"
+        ],
+        undef,
+        \%env,
+    );
+    is($results->{exit_code}, 0, 'openai ordering: session exits cleanly');
+
+    my @bodies = sort glob("$capture_dir/req_*_body.json");
+    is(scalar @bodies, 2, 'openai ordering: captured both requests');
+
+    my $second = decode_json(slurp($bodies[1]));
+    my @input  = @{$second->{input}};
+
+    my ($context_index, $history_index);
+    for my $i (0 .. $#input) {
+        my $content = $input[$i]{content} // '';
+        next if ref $content;
+        $context_index = $i
+          if !defined $context_index
+          && $content =~ /Relevant file\/context state/;
+        $history_index = $i
+          if !defined $history_index
+          && $content =~ /first shared ordering turn/;
+    }
+    ok(defined $context_index, 'openai ordering: request has context block');
+    ok(defined $history_index, 'openai ordering: request has history');
+    cmp_ok($context_index, '<', $history_index,
+        'openai ordering: context precedes conversation history');
+
+    ok(!_contains_cache_control($second),
+        'openai ordering: no Anthropic cache_control leaks into request');
+    ok(
+        !(grep { exists $_->{synergy_cache_role} } @input),
+        'openai ordering: no builder cache tags leak into request'
+    );
+    ok(
+        !(grep { exists $_->{synergy_images} } @input),
+        'openai ordering: no builder image tags leak into request'
     );
 }
 
